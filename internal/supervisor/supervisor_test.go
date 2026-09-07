@@ -12,6 +12,8 @@ import (
 
 	"github.com/FasterEdge/DontCrack-Manager/internal/config"
 	"github.com/FasterEdge/DontCrack-Manager/internal/logging"
+	"github.com/FasterEdge/DontCrack-Manager/internal/status"
+	osexec "os/exec"
 )
 
 // stubScript 是"假 DontCrack"存根(必须用 bash: dash 的 wait 在收到信号时不保证立即执行 trap):
@@ -426,5 +428,58 @@ func TestMergeEnvOrder(t *testing.T) {
 	}
 	if len(env) != len(base)+len(extra) {
 		t.Fatalf("env 数量异常: %d != %d", len(env), len(base)+len(extra))
+	}
+}
+
+// isReady 必须有心跳快照时要求子进程 running —— 无探针服务的子进程崩溃死亡后
+// 聚合 /healthz 必须能反映(此前只看 DontCrack 进程存活, 会误报 200)。
+func TestIsReadyUsesHeartbeatState(t *testing.T) {
+	svc := &Service{
+		state: StateRunning,
+		cmd:   &osexec.Cmd{Process: &os.Process{Pid: 1}},
+		hb:    &status.HeartbeatInfo{State: "running"},
+	}
+	if !svc.isReady() {
+		t.Fatal("心跳 running 时应就绪")
+	}
+
+	// 子进程死亡: 心跳快照 state=stopped(无探针服务) → 必须不就绪
+	svc.hb.State = "stopped"
+	if svc.isReady() {
+		t.Fatal("心跳 stopped(子进程已死)时必须不就绪")
+	}
+	svc.hb.State = "Running" // 大小写不敏感
+	if !svc.isReady() {
+		t.Fatal("心跳 Running(大写)应就绪")
+	}
+
+	// 启动初期尚无快照: 无探针服务宽容放行
+	svc.hb = nil
+	if !svc.isReady() {
+		t.Fatal("无心跳快照时, 无探针服务应宽容就绪")
+	}
+
+	// 有探针服务无快照: 必须等待真实快照(不得早于真实健康放行)
+	svc.cfg = &config.Service{ProbeCmd: "true"}
+	svc.hb = nil
+	if svc.isReady() {
+		t.Fatal("有探针服务无心跳快照时必须不就绪")
+	}
+	svc.hb = &status.HeartbeatInfo{State: "running"}
+	if !svc.isReady() {
+		t.Fatal("有探针服务心跳 running 时应就绪")
+	}
+	svc.cfg = &config.Service{}
+
+	// DontCrack 自身不在运行 → 任何情况下不就绪
+	svc.hb = &status.HeartbeatInfo{State: "running"}
+	svc.state = StateStopped
+	if svc.isReady() {
+		t.Fatal("DontCrack 未运行时必须不就绪")
+	}
+	svc.state = StateRunning
+	svc.cmd.Process = nil
+	if svc.isReady() {
+		t.Fatal("进程对象缺失时必须不就绪")
 	}
 }

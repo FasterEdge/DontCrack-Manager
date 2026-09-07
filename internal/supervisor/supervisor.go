@@ -333,20 +333,26 @@ func (sv *Service) waitDeps(ctx context.Context) bool {
 	return true
 }
 
-// isReady 依赖就绪判定: DontCrack 进程存活; 配置了探针的服务还需心跳 State==running。
+// isReady 依赖就绪判定: DontCrack 进程存活, 且(有心跳快照时)其子进程也在运行。
+// 注意: 此前仅在配置了探针时才检查子进程状态 —— 无探针服务的子进程崩溃死亡后
+// 聚合 /healthz 仍返回 200, 且下游依赖会误判就绪(信息有却不用)。现只要有心跳
+// 快照(hb != nil)一律要求 hb.State == running; 启动初期尚无快照时宽容放行
+// (spawn 后立即刷新一次心跳)。
 func (sv *Service) isReady() bool {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 	if sv.state != StateRunning || sv.cmd == nil || sv.cmd.Process == nil {
 		return false
 	}
-	if sv.cfg.ProbeCmd != "" {
-		hb := sv.hb
-		if hb == nil || !strings.EqualFold(hb.State, "running") {
-			return false
-		}
+	hb := sv.hb
+	if hb == nil {
+		// 启动初期尚无心跳快照: 有探针服务的就绪判定必须依赖子进程状态 ——
+		// 无快照不得放行(否则依赖/聚合会早于真实健康误判就绪, 见 e2e 第 3/5 节
+		// 时序: 聚合 200 时 web.hb 尚为 nil → 抓快照即 FAIL);
+		// 无探针服务宽容放行(无子进程状态依据, stub/裸运行无 HTTP 也须可用)。
+		return sv.cfg == nil || sv.cfg.ProbeCmd == ""
 	}
-	return true
+	return strings.EqualFold(hb.State, "running")
 }
 
 // spawn 构造并启动 DontCrack 进程, 绑定日志输出。
