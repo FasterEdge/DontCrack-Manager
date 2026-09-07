@@ -3,9 +3,14 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -481,5 +486,46 @@ func TestIsReadyUsesHeartbeatState(t *testing.T) {
 	svc.cmd.Process = nil
 	if svc.isReady() {
 		t.Fatal("进程对象缺失时必须不就绪")
+	}
+}
+
+// refreshHeartbeat 失败时必须保留旧快照(瞬时网络失败不应让 hb 变 nil,
+// 健康状态闪烁); healthz=down 由 hbErr 独立反映。
+func TestRefreshHeartbeatKeepsOldSnapshotOnFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(status.HeartbeatInfo{State: "running", ProcessPID: 4242})
+	}))
+	t.Cleanup(srv.Close)
+	host, portStr, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv := &Service{
+		state: StateRunning,
+		cfg:   &config.Service{ListenAddress: host, Port: port},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sv.refreshHeartbeat(ctx) // 首次刷新成功
+	sv.mu.Lock()
+	if sv.hb == nil || sv.hb.State != "running" || sv.hbErr != nil {
+		t.Fatalf("首次刷新应成功: hb=%+v err=%v", sv.hb, sv.hbErr)
+	}
+	sv.mu.Unlock()
+
+	srv.Close() // 模拟瞬时网络失败
+	sv.refreshHeartbeat(ctx)
+	sv.mu.Lock()
+	defer sv.mu.Unlock()
+	if sv.hb == nil || sv.hb.State != "running" || sv.hb.ProcessPID != 4242 {
+		t.Fatalf("失败刷新必须保留旧快照, 当前 hb=%+v", sv.hb)
+	}
+	if sv.hbErr == nil {
+		t.Fatal("失败刷新必须记录 hbErr(healthz=down 依赖它)")
 	}
 }

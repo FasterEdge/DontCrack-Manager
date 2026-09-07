@@ -397,6 +397,12 @@ func (sv *Service) spawn(ctx context.Context) error {
 	sv.log.Infof("DontCrack 已启动 pid=%d binary=%s", cmd.Process.Pid, binary)
 
 	// 启动后立即刷新一次心跳(加速依赖就绪判定)。
+	// 先清空旧代快照: 上一代 DontCrack 的 hb 不得被新代沿用(否则立即刷新失败时
+	// refreshHeartbeat 会保留旧值, 新进程被误判为携带旧状态就绪)。
+	sv.mu.Lock()
+	sv.hb = nil
+	sv.hbErr = nil
+	sv.mu.Unlock()
 	sv.refreshHeartbeat(ctx)
 	return nil
 }
@@ -575,7 +581,11 @@ func (sv *Service) refreshHeartbeat(ctx context.Context) {
 	cli := status.NewClient(status.HostPort(addr, port), password)
 	hb, err := cli.Heartbeat(hbCtx)
 	sv.mu.Lock()
-	sv.hb = hb
+	// 失败时保留旧快照(瞬时网络失败不应让健康状态闪烁/hb 变 nil);
+	// healthz=down 由 hbErr 独立反映, 不依赖 hb 被清空。
+	if err == nil {
+		sv.hb = hb
+	}
 	sv.hbErr = err
 	sv.hbAt = time.Now()
 	sv.mu.Unlock()
