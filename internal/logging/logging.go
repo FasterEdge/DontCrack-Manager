@@ -101,13 +101,13 @@ func (l *Logger) Warnf(format string, args ...any) { l.logf(LevelWarn, format, a
 func (l *Logger) Errorf(format string, args ...any) { l.logf(LevelError, format, args...) }
 
 func (l *Logger) logf(level Level, format string, args ...any) {
-	if level < l.level {
-		return
-	}
 	msg := fmt.Sprintf(format, args...)
 	line := fmt.Sprintf("%s %-5s %s%s\n",
 		time.Now().Format("2006-01-02 15:04:05.000"), level.String(), l.prefix, msg)
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if level < l.level { // 级别判断与 SetLevel 同锁, 消除读取竞态
+		return
+	}
 	_, _ = io.WriteString(l.out, line)
 }
