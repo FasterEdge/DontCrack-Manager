@@ -1,10 +1,14 @@
-# DontCrack-Manager — DontCrack 多进程根管理器
+<div align="center">
+<img src="./Logo.png" alt="logo" width="100"/>
+<h2>DontCrack-Manager</h2>
+<h3>DontCrack 多进程根管理器</h3>
+</div>
 
-> FasterEdge 开源项目 · [Github](https://github.com/FasterEdge) · [Gitee](https://gitee.com/FasterEdge)
+### 一、功能简介
 
-**单体的 DontCrack 一次只能管理一个进程。** DontCrack-Manager 同时拉起并监管
-**多个 DontCrack 实例**(每个实例监管一个子进程), 作为嵌入式 Linux / 精简容器等
-**无进程管理器环境下的系统多进程根管理器**。
+- **单体的 DontCrack 一次只能管理一个进程。** DontCrack-Manager 同时拉起并监管
+  **多个 DontCrack 实例**(每个实例监管一个子进程), 作为嵌入式 Linux / 精简容器等
+  **无进程管理器环境下的系统多进程根管理器**。
 
 ```
 ┌────────────────────────────────────────────────────────────┐
@@ -20,8 +24,6 @@
 └────────────────────────────────────────────────────────────┘
 ```
 
-## 特性
-
 - **多实例监管**: 一份 YAML 配置承载 N 个服务, 每个服务由一个 DontCrack 实例监管;
 - **真实契约**: 完整复用 DontCrack CLI flags 与 HTTP API(`/heartbeat` `/healthz`), 零假设;
 - **依赖编排**: `depends_on` 声明启动顺序, 依赖服务就绪(进程存活 + 可选探针健康)后才启动;
@@ -33,7 +35,7 @@
 - **安全 fail-closed**: 依赖环/重复端口/非法策略一律拒绝启动; 对外监听必须配置密码
   (常数时间比较, 与 DontCrack 家族一致); 所有健康查询与停机宽限均有超时。
 
-## 快速开始
+### 二、快速开始
 
 ```bash
 # 构建
@@ -51,7 +53,7 @@ curl http://127.0.0.1:11884/status
 curl -X POST http://127.0.0.1:11884/shutdown   # 远程优雅停机
 ```
 
-## 配置参考
+### 三、配置参考
 
 ```yaml
 log_level: info                 # debug|info|warn|error
@@ -89,7 +91,7 @@ services:
     enabled: true
 ```
 
-## HTTP API
+### 四、HTTP API
 
 | 路径 | 方法 | 说明 |
 | ---- | ---- | ---- |
@@ -99,21 +101,21 @@ services:
 
 鉴权优先级与 DontCrack 一致: `Authorization: Bearer <pw>` > `X-DontCrack-Password` > `?password=`。
 
-## 停机语义
+### 五、停机语义
 
 1. 收到 SIGINT/SIGTERM(或 `/shutdown`);
 2. 取消心跳刷新与依赖等待, 向每个 DontCrack 实例发送 SIGTERM(DontCrack 会先停其子进程);
 3. 等待全部退出, 上限 `shutdown_grace`;
 4. 宽限后仍存活的进程 SIGKILL 兜底(fail-closed, 不留孤儿)。
 
-## 与 DontCrack 的分工
+### 六、与 DontCrack 的分工
 
 | 层 | 职责 |
 | -- | ---- |
 | DontCrack 实例 | 单子进程的启动/探针/自动重启/日志 |
 | DontCrack-Manager | 多实例依赖编排、DontCrack 进程自身的存活监管与恢复、聚合状态 |
 
-## 完整体端到端联调
+### 七、完整体端到端联调
 
 `e2e/` 目录提供可复现的端到端测试:构建**真实 DontCrack 二进制**,用根管理器同时监管
 3 个服务(db 常驻 / web 依赖 db 带 HTTP 探针 / worker 周期性崩溃),覆盖:
@@ -138,17 +140,17 @@ docker run --rm \
 > ② DontCrack auto-restart 永不生效(`CurrentProcess` 未释放导致重启计划恒判过期);
 > ③ 根管理器"不留孤儿"承诺未兑现(DontCrack 被强杀后其子进程成孤儿 → Setpgid 进程组管理)。
 
-## 测试
+### 八、测试
 
 ```bash
 go vet ./...
 go test -race ./...
 ```
 
-## 安全
+### 九、安全
 
 见 [SECURITY.md](SECURITY.md)。漏洞报告请私信 FasterEdge 组织(tyza66@outlook.com)。
 
-## License
+### 十、License
 
 [Apache 2.0](LICENSE)
