@@ -113,6 +113,31 @@ services:
 | DontCrack 实例 | 单子进程的启动/探针/自动重启/日志 |
 | DontCrack-Manager | 多实例依赖编排、DontCrack 进程自身的存活监管与恢复、聚合状态 |
 
+## 完整体端到端联调
+
+`e2e/` 目录提供可复现的端到端测试:构建**真实 DontCrack 二进制**,用根管理器同时监管
+3 个服务(db 常驻 / web 依赖 db 带 HTTP 探针 / worker 周期性崩溃),覆盖:
+
+1. 多实例启动、依赖顺序(db 先于 web);
+2. 探针健康判定(`healthz=up` + `/heartbeat` 快照 `state=running`);
+3. DontCrack 层 auto-restart(worker 崩溃自动重启,state-file 计数递增);
+4. Manager 层重启(kill 掉 DontCrack 进程 → `restart=on-failure` 恢复);
+5. 无孤儿保证(kill -9 DontCrack 后,其子进程按进程组清理);
+6. 聚合 API `/healthz` `/status` 与优雅停机 `/shutdown`(进程全清、退出码 0)。
+
+```bash
+docker run --rm \
+  -v $(pwd):/src/dcm \
+  -v /path/to/DontCrack4ManyLinux:/src/dc4m \
+  -v /path/to/this/repo/e2e:/e2e -w /e2e \
+  golang:1.25 bash /e2e/e2e_test.sh
+```
+
+> 该联调曾抓出并修复:① DontCrack flag 解析错位(`-args` 值以 `-` 开头被 flag 包吞并,
+> 端口等后续配置落默认值 → 全量改用 `-flag=value` 形式 + DontCrack 侧 fail-closed 防御);
+> ② DontCrack auto-restart 永不生效(`CurrentProcess` 未释放导致重启计划恒判过期);
+> ③ 根管理器"不留孤儿"承诺未兑现(DontCrack 被强杀后其子进程成孤儿 → Setpgid 进程组管理)。
+
 ## 测试
 
 ```bash

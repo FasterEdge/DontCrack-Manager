@@ -1,0 +1,45 @@
+# 完整体联调配置: 3 个服务, 每个由一个真实 DontCrack 实例监管。
+log_level: info
+listen: 127.0.0.1:11899          # DontCrack-Manager 聚合状态端口(避开各实例端口)
+dontcrack_binary: /e2e/bin/dontcrack
+shutdown_grace: 10s
+
+services:
+  # db: 常驻子进程(childproc normal), 无探针
+  - name: db
+    path: /e2e/bin/childproc
+    args: "-mode normal -interval 5s -message db"
+    port: 11883
+    start_now: true
+    restart: always
+    backoff: 1s
+    backoff_max: 10s
+
+  # web: 依赖 db; 带 HTTP 探针, 验证依赖顺序 + 探针健康判定
+  - name: web
+    path: /e2e/bin/tinyhttp
+    args: "-addr :9090"
+    port: 11884
+    start_now: true
+    depends_on: [db]
+    depend_timeout: 20s
+    probe_cmd: "wget -q -O /dev/null http://127.0.0.1:9090/healthz"
+    probe_interval: 3
+    probe_timeout: 2
+    probe_failure_limit: 2
+    restart: on-failure
+    backoff: 1s
+    backoff_max: 10s
+
+  # worker: 周期性崩溃(lifetime 6s, exit 42), 由 DontCrack auto-restart 无限重启;
+  # state-file 跨重启计数, 验证 DontCrack 层子进程自动重启。
+  - name: worker
+    path: /e2e/bin/childproc
+    args: "-mode crash -lifetime 6s -interval 3s -state-file /tmp/worker.state -message worker"
+    port: 11885
+    auto_restart: true
+    max_retries: -1
+    start_now: true
+    restart: always
+    backoff: 1s
+    backoff_max: 10s

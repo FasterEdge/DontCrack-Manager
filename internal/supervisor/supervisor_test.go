@@ -96,10 +96,10 @@ services:
 
 	waitMarker(t, logf, "started", 8*time.Second)
 
-	// 验证 flag 透传。
+	// 验证 flag 透传("=" 形式, 避免 Go flag 包对 "-" 开头值错位吞并)。
 	data, _ := os.ReadFile(logf)
 	first := strings.SplitN(string(data), "\n", 2)[0]
-	for _, want := range []string{"-port 11883", "-path /opt/app/web", "-auto-restart false", "-start-now false"} {
+	for _, want := range []string{"-port=11883", "-path=/opt/app/web", "-auto-restart=false", "-start-now=false"} {
 		if !strings.Contains(first, want) {
 			t.Fatalf("透传 flag 缺少 %q: %s", want, first)
 		}

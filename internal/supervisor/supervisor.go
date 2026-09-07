@@ -50,6 +50,7 @@ type Service struct {
 	mu         sync.Mutex
 	state      State
 	cmd        *exec.Cmd
+	pgid       int           // DontCrack 进程组 ID(Setpgid, 用于清理其死亡后的孤儿子进程)
 	exitCh     chan struct{} // cmd.Wait 返回后关闭(close-once)
 	spawns     int           // DontCrack 启动总次数
 	startedAt  time.Time
@@ -143,9 +144,11 @@ func (s *Supervisor) StopAll(grace time.Duration) {
 		return
 	case <-time.After(grace):
 		// 宽限期后强制终止仍存活的进程(fail-closed: 不留孤儿)。
+		// 按进程组强杀, 连带 DontCrack 遗留的子进程一起清理。
 		for _, sv := range svcs {
-			sv.log.Warnf("宽限期内未退出, 发送 SIGKILL")
+			sv.log.Warnf("宽限期内未退出, 发送 SIGKILL(进程组)")
 			sv.signal(syscall.SIGKILL)
+			sv.signalGroup(syscall.SIGKILL)
 		}
 		select {
 		case <-done:
@@ -349,11 +352,15 @@ func (sv *Service) isReady() bool {
 // spawn 构造并启动 DontCrack 进程, 绑定日志输出。
 // 注意: 使用 exec.Command 而非 CommandContext —— 进程生命周期完全由信号管理
 // (StopAll: SIGTERM → 宽限 → SIGKILL), 避免 ctx 取消时被 SIGKILL 跳过优雅停机。
+// 进程置于独立进程组(Setpgid): 若 DontCrack 被强杀/崩溃, 其子进程会成为孤儿,
+// 重启前按进程组清理, 保证"不留孤儿"(fail-closed)。
 func (sv *Service) spawn(ctx context.Context) error {
+	sv.killOrphans() // 上一次 DontCrack 进程组若有残留(孤儿子进程), 先清理
 	binary := sv.cfg.Binary(sv.sup.cfg.DontCrackBinary)
 	args := sv.buildArgs()
 	//nolint:noctx // 有意不用 CommandContext: 进程生命周期完全由信号管理(见上方注释)。
 	cmd := exec.Command(binary, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), sv.cfg.DontCrackEnv...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -370,6 +377,7 @@ func (sv *Service) spawn(ctx context.Context) error {
 
 	sv.mu.Lock()
 	sv.cmd = cmd
+	sv.pgid = cmd.Process.Pid // Setpgid 下 进程组 ID == 进程 PID
 	sv.exitCh = make(chan struct{})
 	sv.startedAt = time.Now()
 	sv.state = StateRunning
@@ -444,26 +452,32 @@ func (sv *Service) nextBackoff() time.Duration {
 }
 
 // buildArgs 把服务配置翻译为 DontCrack CLI flags。
+//
+// 注意: 全部使用 "-flag=value" 形式。Go flag 包对 "-flag value" 会无条件把
+// 下一个参数当作值; 若 -args 的值以 '-' 开头(常见于子进程参数如
+// "-addr :9090"), 后续 flag 会被错位吞并, 甚至导致 flag 解析提前终止
+// (bool flag 后紧跟的非 flag 参数会终止解析), 使端口/自动重启等落到默认值。
+// "=" 形式对任何值(含空格与前导 '-')都无歧义。
 func (sv *Service) buildArgs() []string {
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 	c := sv.cfg
 	args := []string{
-		"-path", c.Path,
-		"-args", c.Args,
-		"-pre", c.Pre,
-		"-env", c.Env,
-		"-auto-restart", strconv.FormatBool(c.AutoRestart),
-		"-max-retries", strconv.Itoa(c.MaxRetries),
-		"-start-now", strconv.FormatBool(c.StartNow),
-		"-port", strconv.Itoa(c.Port),
-		"-listen-address", c.ListenAddress,
-		"-password", c.Password,
-		"-log-capacity", strconv.Itoa(c.LogCapacity()),
-		"-log-max-line-bytes", "1048576",
-		"-file-log", strconv.FormatBool(c.FileLog),
-		"-log-path", c.LogPath,
-		"-log-life-day", strconv.Itoa(c.LogLifeDay),
+		"-path=" + c.Path,
+		"-args=" + c.Args,
+		"-pre=" + c.Pre,
+		"-env=" + c.Env,
+		"-auto-restart=" + strconv.FormatBool(c.AutoRestart),
+		"-max-retries=" + strconv.Itoa(c.MaxRetries),
+		"-start-now=" + strconv.FormatBool(c.StartNow),
+		"-port=" + strconv.Itoa(c.Port),
+		"-listen-address=" + c.ListenAddress,
+		"-password=" + c.Password,
+		"-log-capacity=" + strconv.Itoa(c.LogCapacity()),
+		"-log-max-line-bytes=1048576",
+		"-file-log=" + strconv.FormatBool(c.FileLog),
+		"-log-path=" + c.LogPath,
+		"-log-life-day=" + strconv.Itoa(c.LogLifeDay),
 	}
 	if c.ProbeCmd != "" {
 		args = append(args,
@@ -485,6 +499,31 @@ func (sv *Service) signal(sig os.Signal) {
 		return
 	}
 	_ = cmd.Process.Signal(sig)
+}
+
+// signalGroup 向整个 DontCrack 进程组发信号(连带其可能遗留的子进程)。
+func (sv *Service) signalGroup(sig syscall.Signal) {
+	sv.mu.Lock()
+	pgid := sv.pgid
+	sv.mu.Unlock()
+	if pgid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pgid, sig) // 组不存在(ESRCH)时忽略
+}
+
+// killOrphans 清理上一次 DontCrack 死亡后遗留的进程组残留(孤儿子进程):
+// SIGTERM 先礼后兵, 300ms 后 SIGKILL 兜底。DontCrack 已死时组内只可能是孤儿。
+func (sv *Service) killOrphans() {
+	sv.mu.Lock()
+	pgid := sv.pgid
+	sv.mu.Unlock()
+	if pgid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	time.Sleep(300 * time.Millisecond)
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 }
 
 // scanLines 逐行转发 DontCrack 输出到日志器。
