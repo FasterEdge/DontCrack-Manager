@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1.7
+# 多阶段构建：golang 编译 → alpine 精简运行镜像
+FROM golang:1.25-alpine AS build
+# 通过 goproxy.cn 拉取依赖, 避免在无外网代理环境(如国内网络/受限内网)构建超时
+ENV GOPROXY=https://goproxy.cn,direct
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/app ./cmd/dontcrack-manager
+
+FROM alpine:3.20
+RUN addgroup -S app && adduser -S -G app app
+COPY --from=build /out/app /usr/local/bin/dontcrack-manager
+# 根管理器聚合状态 HTTP 服务(默认 127.0.0.1:11884; 镜像内自行挂载配置)
+EXPOSE 11884
+ENTRYPOINT ["dontcrack-manager"]

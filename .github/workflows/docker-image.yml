@@ -1,0 +1,37 @@
+name: 'Docker 镜像构建'
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+
+jobs:
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: 'Go 单元测试'
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.25'
+    - name: '运行测试'
+      run: go test ./...
+    - name: '静态检查 go vet'
+      run: go vet ./...
+    - name: '构建 Docker 镜像'
+      run: |
+        docker build -t dontcrack-manager .
+    - name: '导出并上传镜像工件'
+      run: |
+        docker save dontcrack-manager | gzip > dontcrack-manager-image.tar.gz
+    - uses: actions/upload-artifact@v4
+      with:
+        name: 'dontcrack-manager-docker-image-${{ github.ref_name }}'
+        path: 'dontcrack-manager-image.tar.gz'
+        if-no-files-found: 'warn'
+        retention-days: 14

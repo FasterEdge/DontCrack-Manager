@@ -1,0 +1,54 @@
+# DontCrack-Manager 配置示例
+# 单体的 DontCrack 一次只能管理一个进程; 本文件示范如何用根管理器同时监管多个服务。
+
+# 根管理器全局配置 ------------------------------------------------------------
+log_level: info                       # debug|info|warn|error
+listen: 127.0.0.1:11884               # 聚合状态 HTTP(host:port), 留空禁用
+password: ""                          # 对外监听(如 0.0.0.0)必须配置密码, 否则拒绝启动
+dontcrack_binary: dontcrack           # DontCrack 可执行文件(可被服务级覆盖)
+shutdown_grace: 10s                   # SIGTERM 后等待 DontCrack 优雅退出的宽限时间
+
+services:
+  # 服务 1: Web 应用 (DontCrack 自动重启子进程)
+  - name: web
+    path: /opt/app/web-server          # 必填: 被监管的子进程路径
+    args: "--addr :8080"
+    pre: "mkdir -p /run/web"           # 启动前命令(在 sh 中执行)
+    env: "TZ=Asia/Shanghai LOG_LEVEL=info"
+    auto_restart: true                 # 子进程崩溃由 DontCrack 自动拉起
+    max_retries: -1                    # 无限次
+    start_now: true
+    probe_cmd: "curl -sf http://127.0.0.1:8080/healthz"   # 子进程健康探针
+    probe_interval: 10
+    probe_timeout: 3
+    probe_failure_limit: 3
+    listen_address: 127.0.0.1          # 该 DontCrack 实例的 HTTP 监听
+    port: 11883                        # 每实例必须唯一
+    password: ""                       # 对外监听必须配置
+    restart: always                    # DontCrack 进程自身退出后的策略: always|on-failure|never
+    backoff: 3s                        # 重启退避基数(指数增长)
+    backoff_max: 60s                   # 退避上限
+    depends_on: [db]                   # 等待 db 服务就绪后再启动
+    depend_timeout: 60s
+
+  # 服务 2: 数据库 (先于 web 启动)
+  - name: db
+    path: /opt/db/bin/db-server
+    args: "--data /var/lib/db"
+    start_now: true
+    port: 11885
+    restart: on-failure
+    backoff: 2s
+    backoff_max: 30s
+
+  # 服务 3: 一次性任务(禁用示例: 不启动, 也不占用端口)
+  - name: cron-job
+    path: /opt/cron/run.sh
+    port: 11886
+    enabled: false
+
+# 查询根管理器状态:
+#   curl http://127.0.0.1:11884/healthz
+#   curl http://127.0.0.1:11884/status
+#   curl -X POST http://127.0.0.1:11884/shutdown
+# (配置了 password 时: 增加请求头 Authorization: Bearer <password>)
