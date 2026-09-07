@@ -57,7 +57,7 @@ curl -X POST http://127.0.0.1:11884/shutdown   # 远程优雅停机
 
 ```yaml
 log_level: info                 # debug|info|warn|error
-listen: 127.0.0.1:11884         # 聚合状态 HTTP; 对外监听必须配 password
+listen: 127.0.0.1:11884         # 聚合状态 HTTP(留空禁用); 对外监听必须配 password
 password: ""                    # 常数时间鉴权密码
 dontcrack_binary: dontcrack     # DontCrack 可执行文件(可被服务级覆盖)
 shutdown_grace: 10s             # 停机宽限
@@ -82,7 +82,7 @@ services:
     log_path: "./logs/dontcrack"
     log_life_day: 7
     dontcrack_binary: ""        # 服务级覆盖
-    dontcrack_env: ["HTTP_PROXY=http://proxy:7890"]  # 追加给 DontCrack 进程的环境变量
+    dontcrack_env: ["HTTP_PROXY=http://proxy:7890"]  # 追加给 DontCrack 进程的环境变量(同名覆盖继承值)
     restart: always             # Manager 层策略: always|on-failure|never
     backoff: 3s                 # 重启退避基数(指数增长)
     backoff_max: 60s            # 退避上限

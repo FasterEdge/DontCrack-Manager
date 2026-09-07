@@ -36,7 +36,6 @@ const (
 	DefaultBackoffMax    = 60 * time.Second
 	DefaultDependTimeout = 60 * time.Second
 	DefaultShutdownGrace = 10 * time.Second
-	DefaultListen        = "127.0.0.1:11884"
 )
 
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)

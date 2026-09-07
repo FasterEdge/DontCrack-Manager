@@ -361,7 +361,9 @@ func (sv *Service) spawn(ctx context.Context) error {
 	//nolint:noctx // 有意不用 CommandContext: 进程生命周期完全由信号管理(见上方注释)。
 	cmd := exec.Command(binary, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Env = append(os.Environ(), sv.cfg.DontCrackEnv...)
+	// 自定义环境放最前: Linux getenv 取首个匹配, 这样 dontcrack_env 才能覆盖
+	// 继承的同名变量(与 DontCrack 自身 buildChildEnv 的语义一致)。
+	cmd.Env = mergeEnv(sv.cfg.DontCrackEnv, os.Environ())
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -394,6 +396,8 @@ func (sv *Service) spawn(ctx context.Context) error {
 }
 
 // waitExit 阻塞直到 cmd.Wait 返回并关闭 exitCh。
+// 注意: 进程生命周期由信号管理(StopAll: SIGTERM → 宽限 → SIGKILL), 上下文取消
+// 不会终止 DontCrack(见 spawn 中 exec.Command 而非 CommandContext 的注释)。
 func (sv *Service) waitExit(ctx context.Context) {
 	sv.mu.Lock()
 	cmd := sv.cmd
@@ -408,7 +412,15 @@ func (sv *Service) waitExit(ctx context.Context) {
 		sv.exitCh = nil
 	}
 	sv.mu.Unlock()
-	_ = ctx // 上下文取消时 exec.CommandContext 已终止进程
+}
+
+// mergeEnv 合并环境变量: 自定义项在前、继承项在后 —— 子进程 getenv 取首个匹配,
+// 因此自定义项可覆盖继承的同名变量(与 DontCrack buildChildEnv 语义一致)。
+func mergeEnv(extra, base []string) []string {
+	env := make([]string, 0, len(extra)+len(base))
+	env = append(env, extra...)
+	env = append(env, base...)
+	return env
 }
 
 // recordExit 记录退出码并更新退避计数(存活时长达到阈值则重置)。

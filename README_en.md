@@ -59,7 +59,7 @@ curl -X POST http://127.0.0.1:11884/shutdown   # remote graceful shutdown
 
 ```yaml
 log_level: info                 # debug|info|warn|error
-listen: 127.0.0.1:11884         # aggregated status HTTP; external listen requires password
+listen: 127.0.0.1:11884         # aggregated status HTTP (empty disables); external listen requires password
 password: ""                    # constant-time auth password
 dontcrack_binary: dontcrack     # DontCrack executable (overridable per service)
 shutdown_grace: 10s             # shutdown grace period
@@ -84,7 +84,7 @@ services:
     log_path: "./logs/dontcrack"
     log_life_day: 7
     dontcrack_binary: ""        # per-service override
-    dontcrack_env: ["HTTP_PROXY=http://proxy:7890"]  # extra env for the DontCrack process
+    dontcrack_env: ["HTTP_PROXY=http://proxy:7890"]  # extra env for the DontCrack process (same-name overrides inherited)
     restart: always             # manager-level policy: always|on-failure|never
     backoff: 3s                 # restart backoff base (exponential)
     backoff_max: 60s            # backoff cap

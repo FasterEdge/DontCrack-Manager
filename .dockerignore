@@ -8,3 +8,9 @@ Dockerfile
 README*.md
 SECURITY.md
 LICENSE
+
+# e2e 联调运行产物(二进制/日志/状态文件)
+e2e/bin/
+e2e/logs/
+e2e/dcm.log
+e2e/status.json

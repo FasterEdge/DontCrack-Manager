@@ -395,3 +395,36 @@ func TestBuildArgsEqualsForm(t *testing.T) {
 		}
 	}
 }
+
+// mergeEnv 必须把自定义项放最前(子进程 getenv 取首个匹配), 使 dontcrack_env
+// 能覆盖继承的同名变量 —— 此前 append(os.Environ(), extra...) 顺序颠倒,
+// 自定义项永远输给继承值(历史暗病: 如 README 示例的 HTTP_PROXY 静默失效)。
+func TestMergeEnvOrder(t *testing.T) {
+	base := []string{"PATH=/usr/bin", "HTTP_PROXY=http://inherited", "FOO=bar"}
+	extra := []string{"HTTP_PROXY=http://custom", "GOPROXY=https://goproxy.cn,direct"}
+	env := mergeEnv(extra, base)
+	get := func(key string) string {
+		prefix := key + "="
+		for _, kv := range env {
+			if strings.HasPrefix(kv, prefix) {
+				return strings.TrimPrefix(kv, prefix)
+			}
+		}
+		return ""
+	}
+	if v := get("HTTP_PROXY"); v != "http://custom" {
+		t.Fatalf("dontcrack_env 未覆盖同名继承变量: HTTP_PROXY=%q, 期望 http://custom", v)
+	}
+	if v := get("GOPROXY"); v != "https://goproxy.cn,direct" {
+		t.Fatalf("GOPROXY 缺失或顺序错误: %q", v)
+	}
+	if v := get("PATH"); v != "/usr/bin" {
+		t.Fatalf("基础环境被破坏: PATH=%q", v)
+	}
+	if v := get("FOO"); v != "bar" {
+		t.Fatalf("基础环境被破坏: FOO=%q", v)
+	}
+	if len(env) != len(base)+len(extra) {
+		t.Fatalf("env 数量异常: %d != %d", len(env), len(base)+len(extra))
+	}
+}
