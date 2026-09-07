@@ -269,6 +269,9 @@ func (m *Manager) Validate() error {
 			}
 			portSeen[svc.Port] = svc.Name
 		}
+		if svc.Port < 1 || svc.Port > 65535 {
+			errs = append(errs, fmt.Sprintf("服务 %q: port %d 非法(允许 1-65535)", svc.Name, svc.Port))
+		}
 		if svc.MaxRetries < -1 {
 			errs = append(errs, fmt.Sprintf("服务 %q: max_retries 必须 >= -1", svc.Name))
 		}

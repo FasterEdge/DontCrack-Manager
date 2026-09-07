@@ -259,3 +259,13 @@ func TestServiceNameValidation(t *testing.T) {
 	mustFail(t, strings.Replace(goodBase, "name: web", "name: 'bad name!'", 1), "非法")
 	mustFail(t, strings.Replace(goodBase, "name: web", "name: ''", 1), "非法")
 }
+
+func TestPortRangeValidation(t *testing.T) {
+	// 负数端口: 直接拒绝(不再透传给 DontCrack 导致监听失败)
+	mustFail(t, strings.Replace(goodBase, "port: 11883", "port: -1", 1), "port")
+	// 超范围端口: 直接拒绝
+	mustFail(t, strings.Replace(goodBase, "port: 11883", "port: 65536", 1), "port")
+	// 合法边界 1 与 65535 应通过
+	mustParse(t, strings.Replace(goodBase, "port: 11883", "port: 1", 1))
+	mustParse(t, strings.Replace(goodBase, "port: 11883", "port: 65535", 1))
+}

@@ -337,3 +337,61 @@ services:
 	}
 	sup.StopAll(3 * time.Second)
 }
+
+// TestBuildArgsEqualsForm: buildArgs 必须全量使用 "-flag=value" 形式
+// (含探针参数), 任何"空格分隔"形式都会让 Go flag 包把以 '-' 开头的值错位吞并。
+func TestBuildArgsEqualsForm(t *testing.T) {
+	sup := &Supervisor{cfg: &config.Manager{}}
+	svc := &config.Service{
+		Name:              "web",
+		Path:              "/opt/app/web",
+		Args:              "-addr :9090", // 以 '-' 开头的值: 空格形式必炸
+		Pre:               "mkdir -p /run",
+		Env:               "TZ=Asia/Shanghai",
+		AutoRestart:       true,
+		MaxRetries:        3,
+		StartNow:          true,
+		Port:              11884,
+		ListenAddress:     "127.0.0.1",
+		Password:          "secret",
+		LogLifeDay:        7,
+		ProbeCmd:          "wget -q -O /dev/null http://127.0.0.1:9090/healthz",
+		ProbeInterval:     3,
+		ProbeTimeout:      2,
+		ProbeFailureLimit: 2,
+	}
+	svc.LogCapacitySet(200)
+	sv := &Service{cfg: svc, sup: sup}
+	joined := strings.Join(sv.buildArgs(), " ")
+
+	for _, want := range []string{
+		"-path=/opt/app/web",
+		"-args=-addr :9090",
+		"-pre=mkdir -p /run",
+		"-env=TZ=Asia/Shanghai",
+		"-auto-restart=true",
+		"-max-retries=3",
+		"-start-now=true",
+		"-port=11884",
+		"-listen-address=127.0.0.1",
+		"-password=secret",
+		"-log-capacity=200",
+		"-log-max-line-bytes=1048576",
+		"-file-log=false",
+		"-log-life-day=7",
+		"-probe-cmd=wget -q -O /dev/null http://127.0.0.1:9090/healthz",
+		"-probe-interval=3",
+		"-probe-timeout=2",
+		"-probe-failure-limit=2",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("buildArgs 缺少 %q: %s", want, joined)
+		}
+	}
+	// 不允许出现任何空格分隔的 "flag value" 形式(暗病回归防护)。
+	for _, bad := range []string{"-args ", "-port ", "-probe-cmd ", "-auto-restart ", "-password "} {
+		if strings.Contains(joined, bad) {
+			t.Fatalf("buildArgs 混用空格分隔形式: %s", joined)
+		}
+	}
+}

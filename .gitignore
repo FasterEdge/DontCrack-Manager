@@ -57,3 +57,10 @@ Desktop.ini
 
 # Git worktrees
 .worktrees/
+
+# e2e 运行产物(构建二进制与日志)
+/e2e/bin/
+/e2e/logs/
+/e2e/dcm.log
+/e2e/status.json
+

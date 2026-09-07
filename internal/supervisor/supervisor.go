@@ -480,11 +480,12 @@ func (sv *Service) buildArgs() []string {
 		"-log-life-day=" + strconv.Itoa(c.LogLifeDay),
 	}
 	if c.ProbeCmd != "" {
+		// 探针参数同样用 "=" 形式(见上方注释: 空格形式对以 '-' 开头的值错位)。
 		args = append(args,
-			"-probe-cmd", c.ProbeCmd,
-			"-probe-interval", strconv.Itoa(c.ProbeInterval),
-			"-probe-timeout", strconv.Itoa(c.ProbeTimeout),
-			"-probe-failure-limit", strconv.Itoa(c.ProbeFailureLimit),
+			"-probe-cmd="+c.ProbeCmd,
+			"-probe-interval="+strconv.Itoa(c.ProbeInterval),
+			"-probe-timeout="+strconv.Itoa(c.ProbeTimeout),
+			"-probe-failure-limit="+strconv.Itoa(c.ProbeFailureLimit),
 		)
 	}
 	return args
