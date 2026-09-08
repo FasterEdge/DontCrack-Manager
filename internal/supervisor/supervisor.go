@@ -498,7 +498,7 @@ func (sv *Service) buildArgs() []string {
 		"-listen-address=" + c.ListenAddress,
 		"-password=" + c.Password,
 		"-log-capacity=" + strconv.Itoa(c.LogCapacity()),
-		"-log-max-line-bytes=1048576",
+		"-log-max-line-bytes=" + strconv.Itoa(config.DefaultLogMaxLine),
 		"-file-log=" + strconv.FormatBool(c.FileLog),
 		"-log-path=" + c.LogPath,
 		"-log-life-day=" + strconv.Itoa(c.LogLifeDay),
