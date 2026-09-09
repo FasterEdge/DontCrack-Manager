@@ -81,6 +81,9 @@ services:
 	if svc.ProbeInterval != 30 || svc.ProbeTimeout != 5 || svc.ProbeFailureLimit != 3 {
 		t.Fatalf("probe 默认错误: %d/%d/%d", svc.ProbeInterval, svc.ProbeTimeout, svc.ProbeFailureLimit)
 	}
+	if svc.LogPath != DefaultLogPath {
+		t.Fatalf("log_path 默认 = %q, 期望 %q", svc.LogPath, DefaultLogPath)
+	}
 }
 
 func TestUnknownFieldRejected(t *testing.T) {

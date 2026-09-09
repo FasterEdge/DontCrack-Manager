@@ -29,6 +29,7 @@ const (
 	DefaultLogCapacity   = 200
 	DefaultLogMaxLine    = 1048576
 	DefaultLogLifeDay    = 7
+	DefaultLogPath       = "./logs/proc_manager/" // 与 DontCrack 的 -log-path 默认一致
 	DefaultProbeInterval = 30
 	DefaultProbeTimeout  = 5
 	DefaultProbeLimit    = 3
@@ -170,6 +171,9 @@ func (m *Manager) applyDefaults() {
 		}
 		if svc.LogLifeDay == 0 {
 			svc.LogLifeDay = DefaultLogLifeDay
+		}
+		if svc.LogPath == "" {
+			svc.LogPath = DefaultLogPath
 		}
 		if svc.Restart == "" {
 			svc.Restart = RestartAlways

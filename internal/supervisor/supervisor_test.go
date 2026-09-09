@@ -385,6 +385,7 @@ func TestBuildArgsEqualsForm(t *testing.T) {
 		"-log-capacity=200",
 		"-log-max-line-bytes=1048576",
 		"-file-log=false",
+		"-log-path=./logs/proc_manager/",
 		"-log-life-day=7",
 		"-probe-cmd=wget -q -O /dev/null http://127.0.0.1:9090/healthz",
 		"-probe-interval=3",
