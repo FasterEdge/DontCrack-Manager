@@ -10,6 +10,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/dontcrac
 FROM alpine:3.20
 RUN addgroup -S app && adduser -S -G app app
 COPY --from=build /out/app /usr/local/bin/dontcrack-manager
+# 最小权限: 与 DontCrack4ManyLinux 镜像一致, 运行期切换非 root 用户
+# (此前缺 USER app, 容器以 root 运行聚合管理服务——可发信号/管理密码面过大)。
+USER app
 # 根管理器聚合状态 HTTP 服务(默认 127.0.0.1:11884; 镜像内自行挂载配置)
 EXPOSE 11884
 ENTRYPOINT ["dontcrack-manager"]
