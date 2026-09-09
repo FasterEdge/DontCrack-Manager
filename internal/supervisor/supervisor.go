@@ -500,7 +500,7 @@ func (sv *Service) buildArgs() []string {
 		"-log-capacity=" + strconv.Itoa(c.LogCapacity()),
 		"-log-max-line-bytes=" + strconv.Itoa(config.DefaultLogMaxLine),
 		"-file-log=" + strconv.FormatBool(c.FileLog),
-		"-log-path=" + c.LogPath,
+		"-log-path=" + logPathVal(c.LogPath),
 		"-log-life-day=" + strconv.Itoa(c.LogLifeDay),
 	}
 	if c.ProbeCmd != "" {
@@ -513,6 +513,16 @@ func (sv *Service) buildArgs() []string {
 		)
 	}
 	return args
+}
+
+// logPathVal 返回实际写入 -log-path 的值: 空配置回落 DontCrack 默认
+// (与 config.applyDefaults 双保险——经 config.Parse 或测试直构两种途径
+// 构造的 Service 都得到一致的 -log-path, 避免空值覆盖 DontCrack 侧默认)。
+func logPathVal(p string) string {
+	if p == "" {
+		return config.DefaultLogPath
+	}
+	return p
 }
 
 // signal 向 DontCrack 进程发送信号。
