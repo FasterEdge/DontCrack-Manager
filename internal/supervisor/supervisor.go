@@ -366,7 +366,7 @@ func (sv *Service) spawn(ctx context.Context) error {
 	args := sv.buildArgs()
 	//nolint:noctx // 有意不用 CommandContext: 进程生命周期完全由信号管理(见上方注释)。
 	cmd := exec.Command(binary, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = newSysProcAttr()
 	// 自定义环境放最前: Linux getenv 取首个匹配, 这样 dontcrack_env 才能覆盖
 	// 继承的同名变量(与 DontCrack 自身 buildChildEnv 的语义一致)。
 	cmd.Env = mergeEnv(sv.cfg.DontCrackEnv, os.Environ())
@@ -544,7 +544,7 @@ func (sv *Service) signalGroup(sig syscall.Signal) {
 	if pgid <= 0 {
 		return
 	}
-	_ = syscall.Kill(-pgid, sig) // 组不存在(ESRCH)时忽略
+	_ = signalProcessGroup(pgid, sig) // 组不存在(ESRCH)时忽略
 }
 
 // killOrphans 清理上一次 DontCrack 死亡后遗留的进程组残留(孤儿子进程):
@@ -556,9 +556,9 @@ func (sv *Service) killOrphans() {
 	if pgid <= 0 {
 		return
 	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	_ = signalProcessGroup(pgid, syscall.SIGTERM)
 	time.Sleep(300 * time.Millisecond)
-	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	_ = signalProcessGroup(pgid, syscall.SIGKILL)
 }
 
 // scanLines 逐行转发 DontCrack 输出到日志器。
