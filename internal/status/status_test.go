@@ -25,7 +25,7 @@ func fakeDontCrack(t *testing.T, password string, healthy bool) *httptest.Server
 			return
 		}
 		_ = json.NewEncoder(w).Encode(HeartbeatInfo{
-			Version:      "1.0.20260901",
+			Version:      "1.0.20260922",
 			State:        "running",
 			Timestamp:    time.Now().Format(time.RFC3339),
 			ProcessPID:   4242,

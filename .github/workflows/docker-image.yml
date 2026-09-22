@@ -7,8 +7,10 @@ on:
       - main
     tags:
       - 'v*'
+  release:
+    types: [published, released]
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   docker-build:
@@ -31,7 +33,15 @@ jobs:
         docker save dontcrack-manager | gzip > dontcrack-manager-image.tar.gz
     - uses: actions/upload-artifact@v4
       with:
-        name: 'dontcrack-manager-docker-image-${{ github.ref_name }}'
+        # 不能用 github.ref_name: Dependabot PR 分支名含 '/' 会使 artifact name 非法导致上传失败
+        name: 'dontcrack-manager-docker-image-${{ github.run_id }}'
         path: 'dontcrack-manager-image.tar.gz'
         if-no-files-found: 'warn'
         retention-days: 14
+    - name: '上传镜像包到 Release'
+      if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.release.tag_name || github.ref_name }}
+        files: 'dontcrack-manager-image.tar.gz'
+        fail_on_unmatched_files: false
