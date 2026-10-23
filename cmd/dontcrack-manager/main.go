@@ -21,7 +21,7 @@ import (
 )
 
 // version 版本号(与 DontCrack 家族日期版本约定一致)。
-const version = "1.0.20260922"
+const version = "1.0.20261022"
 
 func main() {
 	configPath := flag.String("config", "", "配置文件路径(必填)")
