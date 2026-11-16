@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -41,6 +42,9 @@ while :; do sleep 3600 & wait; done
 
 func writeStub(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("supervisor integration tests require a POSIX shell")
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "dontcrack-stub")
 	if err := os.WriteFile(path, []byte(stubScript), 0o755); err != nil {
