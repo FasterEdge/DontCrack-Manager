@@ -9,6 +9,7 @@ package supervisor
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -387,6 +388,12 @@ func (sv *Service) isReady() bool {
 // 进程纳入进程树收容器(见 newSysProcAttr): 若 DontCrack 被强杀/崩溃, 其子进程
 // 会成为孤儿, 重启前按进程树清理, 保证"不留孤儿"(fail-closed)。
 func (sv *Service) spawn(ctx context.Context) error {
+	return sv.spawnWithTree(ctx, newProcTree())
+}
+
+// spawnWithTree 是 spawn 的可测形式: 收容器由调用方注入(测试用它模拟接管失败),
+// 其余逻辑完全一致 —— 注入点只有 newProcTree(), 没有别的分支。
+func (sv *Service) spawnWithTree(ctx context.Context, tree procTree) error {
 	sv.killOrphans() // 上一次进程树若有残留(孤儿子进程), 先清理
 	binary := sv.cfg.Binary(sv.sup.cfg.DontCrackBinary)
 	args := sv.buildArgs()
@@ -419,9 +426,18 @@ func (sv *Service) spawn(ctx context.Context) error {
 
 	// 纳入进程树收容器: 失败不阻断启动(进程已在跑), 但要留下可诊断的告警 ——
 	// 收容器缺失意味着强杀兜底只能退化为"只杀 DontCrack 本体", 有留孤儿风险。
-	tree := newProcTree()
+	// 两类失败分开说, 因为处置方式不同:
+	//   - ErrAlreadyContained: 进程已被上层收容器接管且禁止嵌套, 强杀能力**由上层继承**,
+	//     本管理器重复收容既无意义也不可能;
+	//   - 其它错误: 收容器真的没建起来, 强杀兜底退化为单进程终止。
+	// 该告警是 README 第五节承诺的行为, 有测试钉住(见 attach_failure_test.go)。
 	if err := tree.attach(cmd.Process); err != nil {
-		sv.log.Warnf("进程树收容器接管失败(强杀兜底能力降级为仅终止 DontCrack 本体): %v", err)
+		if errors.Is(err, ErrAlreadyContained) {
+			sv.log.Warnf("进程树收容器接管失败(进程已被上层收容器接管, 强杀兜底交由上层; "+
+				"本管理器降级为仅终止 DontCrack 本体): %v", err)
+		} else {
+			sv.log.Warnf("进程树收容器接管失败(强杀兜底能力降级为仅终止 DontCrack 本体): %v", err)
+		}
 	}
 	sv.mu.Lock()
 	sv.tree = tree

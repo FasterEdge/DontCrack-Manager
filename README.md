@@ -97,7 +97,7 @@ services:
 | 路径 | 方法 | 说明 |
 | ---- | ---- | ---- |
 | `/healthz` | GET | **liveness**: 根管理器自身存活即 200; 与业务服务健康**无关**(业务抖动不应触发重启) |
-| `/readyz` | GET | **readiness**: 全部启用服务的 `depends_on` 依赖就绪且探针通过 → 200; 否则 503 |
+| `/readyz` | GET | **readiness**: 全部启用服务的 `depends_on` 依赖就绪且探针通过 → 200; 否则 503(**判定口径与能力边界见下**) |
 | `/status` | GET | 每服务 JSON 详情(DontCrack PID/子进程 PID/心跳快照/重启次数/最后退出码) |
 | `/shutdown` | POST | 触发全量优雅停机 |
 
@@ -108,6 +108,22 @@ services:
 - `/readyz` 与内部 `waitDeps` 共用**同一个**就绪判定函数, 因此"readyz 通过"与"依赖方可以启动"
   是同一个事实, 不会出现 readyz 说就绪而依赖方仍被拦下的割裂。无任何启用服务时 fail-closed 返回 503。
 
+`/readyz` 的能力边界(判定口径按服务逐项检查, 任一不满足即 503):
+
+1. 每个启用服务的 DontCrack 进程必须存活(`state=running` 且进程对象存在);
+2. **有心跳快照时**, 其子进程状态必须为 `running`;
+3. **无心跳快照且该服务未配置 `probe_cmd`** 时**直接放行** —— 这是有意的宽松:
+   没有子进程状态依据(无心跳)也没有探针可问, 若一律拦截, stub/裸运行这类
+   无 HTTP 服务将永远无法就绪。因此此状态下 `/readyz` 为 200 **不代表子进程存活**,
+   只代表 DontCrack 本体在跑;
+4. **无心跳快照但配置了 `probe_cmd`** 时**不放行** —— 有探针可问却问不到, 说明
+   尚未拿到真实健康证据, 宁缺毋滥(等 `heartbeatLoop` 下一次刷新, 周期 5s);
+5. 心跳拉取失败时会**保留上一份快照**(瞬时网络故障不让健康状态闪烁),
+   因此子进程崩溃后 `/readyz` 从 200 翻 503 最快需要一个心跳周期, 不是即时。
+
+简言之: `/readyz` 通过 = "每个启用服务的 DontCrack 本体存活, 且**能拿到的**健康证据都正常";
+它不保证无探针服务的子进程一定活着。
+
 鉴权优先级与 DontCrack 一致: `Authorization: Bearer <pw>` > `X-DontCrack-Password` > `?password=`。
 
 ### 五、停机语义与进程树收容
@@ -115,7 +131,7 @@ services:
 停机:
 
 1. 收到 SIGINT/SIGTERM(或 `/shutdown`);
-2. 取消心跳刷新与依赖等待, 向每个 DontCrack 实例发送优雅停止请求(SIGTERM / Windows 等价物);
+2. 向每个 DontCrack 实例发送优雅停止请求(SIGTERM / Windows 等价物), 随后取消心跳刷新与依赖等待;
 3. 等待全部退出, 上限 `shutdown_grace`;
 4. 宽限后仍存活的进程**强制终止整棵进程树**兜底(fail-closed, 不留孤儿)。
 
@@ -124,13 +140,36 @@ services:
 | 平台 | 收容器 | 优雅停止 | 强杀兜底 | 能力边界 |
 | ---- | ------ | -------- | -------- | -------- |
 | Linux/macOS | 独立进程组(`Setpgid`) | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)` | 子进程若自行 `setsid` 脱离进程组, 则不在强杀范围 |
-| Windows | 每实例一个 Job Object(`KILL_ON_JOB_CLOSE`) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`(等价 SIGTERM) | `TerminateJobObject`(整棵树) | 若 DontCrack 无控制台(服务化启动), 优雅通道可能无效 → 只能靠宽限期后强杀; 子进程若带 `BREAKAWAY_OK` 逃逸出 Job 则不在范围内 |
+| Windows | 每实例一个 Job Object(`KILL_ON_JOB_CLOSE`) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`(等价 SIGTERM) | `TerminateJobObject`(整棵树) | 若 DontCrack 无控制台(服务化启动), 优雅通道可能无效 → 只能靠宽限期后强杀; 子进程若带 `BREAKAWAY_OK` 逃逸出 Job 则不在强杀范围; 若进程已被上层收容器接管且禁止嵌套, 强杀交给上层(见下) |
+
+Windows 侧的实现细节(与代码一一对应):
+
+- **每次 `spawn` 新建一个 Job Object**, 不复用、不跨代继承: `CreateJobObject` → 设
+  `KILL_ON_JOB_CLOSE` → `AssignProcessToJobObject`(`process_windows.go` 的 `attach`)。
+  每代 DontCrack 一个收容器, 上一代的句柄在清理时关闭, 因此某一代崩溃不会连累下一代;
+- **`HideWindow: true`**(`process_windows.go` 的 `newSysProcAttr`): DontCrack 以
+  隐藏窗口方式启动, 不弹控制台黑窗 —— 它是桌面环境下以管理器形式后台运行的进程,
+  弹窗会被误认为病毒行为; 同时仍带 `CREATE_NEW_PROCESS_GROUP`, 使
+  `CTRL_BREAK_EVENT` 能精确投给该实例自己的控制台进程组而不波及其它服务;
+- **孤儿清理先礼后兵**(`killOrphans` → `sweepTree`, 宽限 `orphanGrace = 300ms`):
+  触发点是 `spawn` 开头(每代启动前)与服务监管循环退出时的 `defer`。顺序为
+  `graceful()` → 等 **300ms** → `force()` → `close()`。因为该路径上 DontCrack 本体
+  已死, 树内只可能是孤儿, 300ms 只是给还活着的子进程一个响应 `CTRL_BREAK` 的机会,
+  等不到就整棵树强杀 —— 不留孤儿优先于优雅性。
 
 > Windows 上此前退化为 `taskkill /T /F`(纯硬杀, 无优雅语义)。现改为 Job Object 收容 +
 > CTRL_BREAK 优雅请求: 强杀语义由内核保证(不再依赖外部命令), 且监管器自身异常退出时
 > 句柄关闭会触发 `KILL_ON_JOB_CLOSE` 清掉树内残留 —— 比 `taskkill` 更强的不留孤儿保证。
-> 收容器接管失败(例如本进程已被上层 Job 收容且禁止嵌套)时不会阻断启动, 会写告警并把
-> 强杀能力降级为"仅终止 DontCrack 本体"。
+> 收容器接管失败(例如进程已被上层 Job 收容且该 Job 禁止嵌套, `AssignProcessToJobObject`
+> 返回 `ERROR_ACCESS_DENIED`)时**不会阻断启动**: 会以 **WARN** 级别写告警并说明
+> 强杀能力降级为"仅终止 DontCrack 本体"; 该失败以 `ErrAlreadyContained` sentinel 上报,
+> 上层据此与"其它收容故障"区分处置。早前实现把 `ERROR_ACCESS_DENIED` 直接 `return nil`
+> 吞掉, 导致这条告警永不触发, 已修复。
+>
+> 能力边界(如实): 现代 Windows 允许 Job 嵌套, 因此 `ERROR_ACCESS_DENIED` 主要出现在
+> 旧版内核语义 / 特定容器宿主上; 本仓库的单元测试无法在其上自然复现该 Win32 分支
+> (实测记录见 `internal/supervisor/process_windows_test.go`), 该路径由"attach 错误出口
+> 断言 + WARN 链路测试"覆盖, 而非由真实嵌套 Job 场景覆盖。
 
 ### 六、与 DontCrack 的分工
 

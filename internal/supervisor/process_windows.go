@@ -45,9 +45,14 @@ var _ procTree = (*winJobTree)(nil)
 // newProcTree 创建平台进程树收容器(windows: Job Object)。
 func newProcTree() procTree { return &winJobTree{} }
 
-// newSysProcAttr 让 DontCrack 以独立控制台进程组启动: 这样它自己的控制台进程组
-// ID 等于自身 PID, graceful 的 CTRL_BREAK_EVENT 可精确送达该实例(不会波及其它
-// 服务), 且与 unix 的 Setpgid 语义对等(每实例一棵树, 互不干扰)。
+// newSysProcAttr 让 DontCrack 以独立控制台进程组 + 隐藏窗口方式启动:
+//   - CREATE_NEW_PROCESS_GROUP: 它自己的控制台进程组 ID 等于自身 PID, graceful 的
+//     CTRL_BREAK_EVENT 可精确送达该实例(不会波及其它服务), 且与 unix 的 Setpgid
+//     语义对等(每实例一棵树, 互不干扰);
+//   - HideWindow: 后台运行不弹控制台黑窗 —— 管理器形态下弹窗会被误认为病毒行为,
+//     同时不影响进程生命周期与信号投递。
+//
+// 两个字段都在 README 第五节如实说明。
 func newSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
@@ -80,9 +85,12 @@ func (t *winJobTree) attach(p *os.Process) error {
 	if err := windows.AssignProcessToJobObject(job, proc); err != nil {
 		windows.CloseHandle(job)
 		// 已在其它 Job 中(ERROR_ACCESS_DENIED): 例如被父进程 Job 继承收容。
-		// 这表示"管理器自身已被某个 Job 收容且不允许嵌套", 交给现有收容者。
+		// 这表示"管理器自身已被某个 Job 收容且不允许嵌套", 交给现有收容者 ——
+		// 但必须以**可识别错误**上报, 否则上层无法区分"接管成功"与"降级",
+		// README 承诺的降级告警就不会触发(历史暗病: 此处曾 return nil 吞掉)。
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-			return nil
+			return fmt.Errorf("%w(Job Object): pid=%d, 交由现有收容者: %v",
+				ErrAlreadyContained, p.Pid, err)
 		}
 		return fmt.Errorf("加入 Job Object: %w", err)
 	}

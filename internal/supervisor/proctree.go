@@ -3,9 +3,22 @@
 package supervisor
 
 import (
+	"errors"
 	"os"
 	"time"
 )
+
+// ErrAlreadyContained 是收容器接管失败的一个**可识别子类**: 目标进程已被另一个
+// 进程树收容器接管, 且该收容器不允许嵌套。
+//
+// 上层据此把"接管失败"与"真的没接管上"分开处置: 前者说明强杀兜底已由现有收容器
+// 承担, 后者才是 README 第五节所述的能力降级。历史暗病: windows 侧曾把这一类
+// 失败 `return nil` 静默吞掉, 上层拿不到任何错误, 降级告警永不触发。
+//
+// 只有 windows 会产生它(AssignProcessToJobObject 的 ERROR_ACCESS_DENIED); unix 的
+// 进程组可随时重复加入, attach 恒成功, 因此该 sentinel 在 unix 侧只是被定义而不会
+// 被返回 —— 放在这个平台无关文件里, 是为了让上层的判定与测试在两个平台同构。
+var ErrAlreadyContained = errors.New("进程已被其它进程树收容器接管(禁止嵌套)")
 
 // procTree 抽象"进程树收容器": 把 DontCrack 及其派生子进程纳入同一可寻址范围,
 // 使根管理器在强杀兜底时"不留孤儿"。

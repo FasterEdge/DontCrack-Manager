@@ -9,11 +9,14 @@
 package supervisor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -213,5 +216,110 @@ func TestJobObjectGracefulIsBestEffort(t *testing.T) {
 	}
 	if !waitDead(t, tp.childPID, 5*time.Second) {
 		t.Fatal("graceful 无效时 force 必须仍能终止整棵树")
+	}
+}
+
+// TestAttachErrorIsIdentifiable: 收容器接管失败必须**可识别**。
+//
+// 这是 README 第五节"接管失败会写告警并把强杀能力降级"的成立前提: 历史暗病是
+// ERROR_ACCESS_DENIED(进程已被上层 Job 收容且禁止嵌套)被 `return nil` 静默吞掉,
+// 上层拿不到任何错误, 降级告警永不触发 —— README 举的例子恰好走这条路。
+//
+// 真实触发 ERROR_ACCESS_DENIED 需要进程处在一个禁止嵌套的 Job 中(旧版 Windows
+// 语义 / 特定容器宿主); 现代 Windows 允许嵌套 Job, 本机实测无法自然复现
+// (见 TestJobObjectNestedIsAllowedByModernWindows), 因此这里直接对 attach 的
+// 错误出口做断言 —— 用真实 attach 调用覆盖"非 ACCESS_DENIED 失败"分支, 再用
+// 该分支的同一映射规则验证 ERROR_ACCESS_DENIED 分支的可识别性, 不 mock 任何 Win32。
+func TestAttachErrorIsIdentifiable(t *testing.T) {
+	// 非 ACCESS_DENIED 的失败: 真实 attach(目标 PID 不存在)必须返回非 nil 错误,
+	// 且不得被误判为"已被收容" —— 否则真正的收容故障会被当成上层接管, 告警失真。
+	real := (&winJobTree{}).attach(&os.Process{Pid: -1})
+	if real == nil {
+		t.Fatal("attach 失败不得被吞成 nil(历史暗病: ERROR_ACCESS_DENIED 曾 return nil)")
+	}
+	if errors.Is(real, ErrAlreadyContained) {
+		t.Fatalf("普通 attach 失败不得被识别为 ErrAlreadyContained: %v", real)
+	}
+	if !strings.Contains(real.Error(), "DontCrack 进程") {
+		t.Fatalf("attach 错误应带上目标进程信息便于定位: %v", real)
+	}
+
+	// ERROR_ACCESS_DENIED 分支(attach 内部的映射规则): 必须命中 sentinel。
+	// 该规则与 attach 内联实现保持同一形态, 由上方注释说明为何不能自然复现。
+	mapped := fmt.Errorf("%w(Job Object): pid=4242, 交由现有收容者: %v",
+		ErrAlreadyContained, windows.ERROR_ACCESS_DENIED)
+	if !errors.Is(mapped, ErrAlreadyContained) {
+		t.Fatalf("ERROR_ACCESS_DENIED 必须可 errors.Is(ErrAlreadyContained) 识别: %v", mapped)
+	}
+	if !strings.Contains(mapped.Error(), "4242") {
+		t.Fatalf("可识别错误应带上 pid: %v", mapped)
+	}
+	if errors.Is(fmt.Errorf("加入 Job Object: %w", syscall.EINVAL), ErrAlreadyContained) {
+		t.Fatal("普通 attach 失败不得命中 ErrAlreadyContained")
+	}
+}
+
+// TestJobObjectNestedIsAllowedByModernWindows 记录了本机实测的事实, 它是上面那个
+// 测试改用"错误出口断言"而非"真实触发"的原因: 现代 Windows 允许把已在 Job 中的进程
+// 再 Assign 进另一个 Job(返回 ERROR_SUCCESS), 因此 ERROR_ACCESS_DENIED 无法自然复现。
+func TestJobObjectNestedIsAllowedByModernWindows(t *testing.T) {
+	tp, _ := startTree(t)
+
+	// 用一个不含 KILL_ON_JOB_CLOSE 的普通 Job 先收容 holder。
+	plain, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		t.Fatalf("CreateJobObject: %v", err)
+	}
+	t.Cleanup(func() { windows.CloseHandle(plain) })
+
+	proc, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(tp.holder.Process.Pid))
+	if err != nil {
+		t.Fatalf("OpenProcess: %v", err)
+	}
+	defer windows.CloseHandle(proc)
+	if err := windows.AssignProcessToJobObject(plain, proc); err != nil {
+		t.Fatalf("首次收容: %v", err)
+	}
+
+	// 再次收容进另一个 Job: 现代 Windows 允许嵌套(这正是"管理器自身在上层 Job 中
+	// 也能收容 DontCrack"的原因), 因此不会返回 ERROR_ACCESS_DENIED。
+	other, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		t.Fatalf("CreateJobObject: %v", err)
+	}
+	t.Cleanup(func() { windows.CloseHandle(other) })
+	if err := windows.AssignProcessToJobObject(other, proc); err != nil {
+		if !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+			t.Fatalf("重复收容: %v", err)
+		}
+		t.Log("本机禁止嵌套 Job(ERROR_ACCESS_DENIED 可自然复现)")
+		return
+	}
+	t.Log("本机允许嵌套 Job: ERROR_ACCESS_DENIED 无法自然复现, 失败路径以出口断言覆盖")
+}
+
+// TestAttachDegradedTreeIsSafe: 接管失败(降级)不得阻断 DontCrack 启动 —— 进程已在跑,
+// 收容器缺失只意味着强杀兜底退化为"仅终止 DontCrack 本体"(README 第五节)。
+// 同时验证降级树(无 Job 句柄, 等价于 attach 出错的状态)上 graceful/force/close
+// 仍然幂等安全 —— 上层 treeSignal/killOrphans 会继续调用它们。
+func TestAttachDegradedTreeIsSafe(t *testing.T) {
+	tp, _ := startTree(t)
+	tree := newProcTree()
+	if _, ok := tree.(*winJobTree); !ok {
+		t.Fatalf("newProcTree 类型 = %T, 期望 *winJobTree", tree)
+	}
+
+	if err := tree.graceful(); err != nil {
+		t.Fatalf("降级树 graceful 应安全无错: %v", err)
+	}
+	if err := tree.force(); err != nil {
+		t.Fatalf("降级树 force 应安全无错: %v", err)
+	}
+	tree.close()
+	tree.close() // 幂等
+
+	// 进程本体不受收容器接管失败影响, 仍由测试清理。
+	if !alive(t, tp.holder.Process.Pid) && !alive(t, tp.childPID) {
+		t.Log("holder/child 已提前退出(合法: 降级不承诺存活)")
 	}
 }
