@@ -40,7 +40,13 @@ type ServiceStatus struct {
 }
 
 // Provider 由 supervisor 实现, 供聚合 HTTP 服务只读调用。
+//
+// 两个方法对应 K8s 两类探针, 语义刻意不同(此前两者实现相同, 只是文案不同,
+// 探针差异化名不副实):
+//   - Alive: liveness —— 根管理器自身是否存活(能正常响应查询), 与业务服务无关;
+//   - Ready: readiness —— 全部启用服务的 DependsOn 依赖是否就绪且探针通过。
 type Provider interface {
 	Status() []ServiceStatus
-	Healthy() bool
+	Alive() bool
+	Ready() bool
 }

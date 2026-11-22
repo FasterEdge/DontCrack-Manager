@@ -50,7 +50,7 @@ type Service struct {
 	mu         sync.Mutex
 	state      State
 	cmd        *exec.Cmd
-	pgid       int           // DontCrack 进程组 ID(Setpgid, 用于清理其死亡后的孤儿子进程)
+	tree       procTree      // 进程树收容器(unix 进程组 / windows Job Object)
 	exitCh     chan struct{} // cmd.Wait 返回后关闭(close-once)
 	spawns     int           // DontCrack 启动总次数
 	startedAt  time.Time
@@ -79,11 +79,14 @@ type Supervisor struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
+	alive  atomic.Bool // 监管器自身存活(/healthz liveness), 与业务服务状态无关
 }
 
 // New 创建监管器(尚未启动服务)。
 func New(cfg *config.Manager, log *logging.Logger) *Supervisor {
-	return &Supervisor{cfg: cfg, log: log, svcs: make(map[string]*Service, len(cfg.Services))}
+	s := &Supervisor{cfg: cfg, log: log, svcs: make(map[string]*Service, len(cfg.Services))}
+	s.alive.Store(true)
+	return s
 }
 
 // Run 启动全部启用服务的监管循环(非阻塞), 并启动心跳刷新。
@@ -112,11 +115,12 @@ func (s *Supervisor) Run(ctx context.Context) {
 	go s.heartbeatLoop(s.ctx)
 }
 
-// StopAll 停止全部服务并等待退出: SIGTERM → 宽限 → SIGKILL 兜底。
+// StopAll 停止全部服务并等待退出: SIGTERM(等价物) → 宽限 → 强制终止整棵树 兜底。
 func (s *Supervisor) StopAll(grace time.Duration) {
 	if s.cancel == nil {
 		return
 	}
+	s.alive.Store(false)
 
 	s.mu.Lock()
 	svcs := make([]*Service, 0, len(s.svcs))
@@ -125,11 +129,12 @@ func (s *Supervisor) StopAll(grace time.Duration) {
 	}
 	s.mu.Unlock()
 
-	// 先置期望停止并发送 SIGTERM(DontCrack 收到后会优雅停掉其子进程)。
+	// 先置期望停止并请求优雅退出(DontCrack 收到后会优雅停掉其子进程)。
 	for _, sv := range svcs {
 		sv.desired.Store(false)
-		sv.log.Infof("发送 SIGTERM 停止 DontCrack 实例")
+		sv.log.Infof("发送优雅停止请求(SIGTERM 等价物)停止 DontCrack 实例")
 		sv.signal(syscall.SIGTERM)
+		sv.treeSignal(func(t procTree) error { return t.graceful() })
 	}
 
 	// 进程生命周期由信号管理(见 spawn: 不绑定可取消 ctx, 避免取消时被 SIGKILL
@@ -144,11 +149,11 @@ func (s *Supervisor) StopAll(grace time.Duration) {
 		return
 	case <-time.After(grace):
 		// 宽限期后强制终止仍存活的进程(fail-closed: 不留孤儿)。
-		// 按进程组强杀, 连带 DontCrack 遗留的子进程一起清理。
+		// 按进程树强杀, 连带 DontCrack 遗留的子进程一起清理。
 		for _, sv := range svcs {
-			sv.log.Warnf("宽限期内未退出, 发送 SIGKILL(进程组)")
+			sv.log.Warnf("宽限期内未退出, 强制终止进程树(SIGKILL 等价物)")
 			sv.signal(syscall.SIGKILL)
-			sv.signalGroup(syscall.SIGKILL)
+			sv.treeSignal(func(t procTree) error { return t.force() })
 		}
 		select {
 		case <-done:
@@ -201,8 +206,24 @@ func (s *Supervisor) Status() []status.ServiceStatus {
 	return out
 }
 
-// Healthy 全部启用服务均健康才返回 true(供 /healthz 聚合)。
-func (s *Supervisor) Healthy() bool {
+// Alive 是 liveness 语义: 只反映**监管器自身**是否存活(能正常处理状态查询),
+// 与被监管服务的健康状态无关 —— 供 K8s livenessProbe 判断"要不要重启我这个 Pod"。
+//
+// 这与旧实现有本质区别: 此前 /healthz 与 /readyz 实现完全相同, 只是文案不同,
+// 一旦某个业务服务不健康 liveness 就会失败并把进程杀掉, 反而抹掉了自愈机会。
+// 现在监管器只要还在响应查询就报 liveness=up(1), 与业务解耦。
+func (s *Supervisor) Alive() bool {
+	return s.alive.Load()
+}
+
+// Ready 是 readiness 语义: 全部启用服务的 DependsOn 依赖均已就绪, 且自身判定通过
+// (进程存活 + 探针健康/心跳子进程 running) —— 供 K8s readinessProbe / 上游负载均衡
+// 判断"要不要把流量导进来"。
+//
+// 判定口径(isReady)与依赖等待(waitDeps)共用同一函数, 保证"readyz 通过"与
+// "依赖方可以启动"是同一个事实, 不会出现 readyz 说就绪而 waitDeps 仍拒绝的割裂。
+// 无任何启用服务时 fail-closed 返回 false(无从证明就绪)。
+func (s *Supervisor) Ready() bool {
 	s.mu.Lock()
 	svcs := make([]*Service, 0, len(s.svcs))
 	for _, sv := range s.svcs {
@@ -210,7 +231,7 @@ func (s *Supervisor) Healthy() bool {
 	}
 	s.mu.Unlock()
 	if len(svcs) == 0 {
-		return false // 无任何服务: fail-closed
+		return false
 	}
 	for _, sv := range svcs {
 		if !sv.isReady() {
@@ -224,6 +245,11 @@ func (s *Supervisor) Healthy() bool {
 
 func (sv *Service) run(ctx context.Context) {
 	defer sv.sup.wg.Done()
+	// 服务生命周期结束时收尾进程树: 关闭收容器句柄并清理残留成员。
+	// Windows 下这个 defer 尤其关键 —— 服务永久停止(restart=never / 0 退出)时
+	// 若不关闭 Job 句柄, KILL_ON_JOB_CLOSE 的"不留孤儿"兜底也就不会触发,
+	// DontCrack 遗留的子进程会一直活着。
+	defer sv.killOrphans()
 	first := true
 	for {
 		select {
@@ -357,11 +383,11 @@ func (sv *Service) isReady() bool {
 
 // spawn 构造并启动 DontCrack 进程, 绑定日志输出。
 // 注意: 使用 exec.Command 而非 CommandContext —— 进程生命周期完全由信号管理
-// (StopAll: SIGTERM → 宽限 → SIGKILL), 避免 ctx 取消时被 SIGKILL 跳过优雅停机。
-// 进程置于独立进程组(Setpgid): 若 DontCrack 被强杀/崩溃, 其子进程会成为孤儿,
-// 重启前按进程组清理, 保证"不留孤儿"(fail-closed)。
+// (StopAll: SIGTERM → 宽限 → 强杀整棵树), 避免 ctx 取消时被 SIGKILL 跳过优雅停机。
+// 进程纳入进程树收容器(见 newSysProcAttr): 若 DontCrack 被强杀/崩溃, 其子进程
+// 会成为孤儿, 重启前按进程树清理, 保证"不留孤儿"(fail-closed)。
 func (sv *Service) spawn(ctx context.Context) error {
-	sv.killOrphans() // 上一次 DontCrack 进程组若有残留(孤儿子进程), 先清理
+	sv.killOrphans() // 上一次进程树若有残留(孤儿子进程), 先清理
 	binary := sv.cfg.Binary(sv.sup.cfg.DontCrackBinary)
 	args := sv.buildArgs()
 	//nolint:noctx // 有意不用 CommandContext: 进程生命周期完全由信号管理(见上方注释)。
@@ -385,11 +411,20 @@ func (sv *Service) spawn(ctx context.Context) error {
 
 	sv.mu.Lock()
 	sv.cmd = cmd
-	sv.pgid = cmd.Process.Pid // Setpgid 下 进程组 ID == 进程 PID
 	sv.exitCh = make(chan struct{})
 	sv.startedAt = time.Now()
 	sv.state = StateRunning
 	sv.spawns++
+	sv.mu.Unlock()
+
+	// 纳入进程树收容器: 失败不阻断启动(进程已在跑), 但要留下可诊断的告警 ——
+	// 收容器缺失意味着强杀兜底只能退化为"只杀 DontCrack 本体", 有留孤儿风险。
+	tree := newProcTree()
+	if err := tree.attach(cmd.Process); err != nil {
+		sv.log.Warnf("进程树收容器接管失败(强杀兜底能力降级为仅终止 DontCrack 本体): %v", err)
+	}
+	sv.mu.Lock()
+	sv.tree = tree
 	sv.mu.Unlock()
 
 	go sv.scanLines(stdout, "out")
@@ -536,29 +571,27 @@ func (sv *Service) signal(sig os.Signal) {
 	_ = cmd.Process.Signal(sig)
 }
 
-// signalGroup 向整个 DontCrack 进程组发信号(连带其可能遗留的子进程)。
-func (sv *Service) signalGroup(sig syscall.Signal) {
+// treeSignal 对当前进程树执行动作(graceful/force)。收容器缺失或动作失败时忽略
+// (强杀兜底已由 signal 单进程终止覆盖)。
+func (sv *Service) treeSignal(fn func(procTree) error) {
 	sv.mu.Lock()
-	pgid := sv.pgid
+	tree := sv.tree
 	sv.mu.Unlock()
-	if pgid <= 0 {
+	if tree == nil {
 		return
 	}
-	_ = signalProcessGroup(pgid, sig) // 组不存在(ESRCH)时忽略
+	_ = fn(tree)
 }
 
-// killOrphans 清理上一次 DontCrack 死亡后遗留的进程组残留(孤儿子进程):
-// SIGTERM 先礼后兵, 300ms 后 SIGKILL 兜底。DontCrack 已死时组内只可能是孤儿。
+// killOrphans 清理上一次 DontCrack 死亡后遗留的进程树残留(孤儿子进程):
+// 先请求优雅退出, 短宽限后强制终止整棵树并释放收容器。
+// DontCrack 已死时树内只可能是孤儿, 强杀是唯一可靠手段。
 func (sv *Service) killOrphans() {
 	sv.mu.Lock()
-	pgid := sv.pgid
+	tree := sv.tree
+	sv.tree = nil
 	sv.mu.Unlock()
-	if pgid <= 0 {
-		return
-	}
-	_ = signalProcessGroup(pgid, syscall.SIGTERM)
-	time.Sleep(300 * time.Millisecond)
-	_ = signalProcessGroup(pgid, syscall.SIGKILL)
+	sweepTree(tree)
 }
 
 // scanLines 逐行转发 DontCrack 输出到日志器。

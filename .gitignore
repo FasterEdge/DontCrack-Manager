@@ -62,5 +62,7 @@ Desktop.ini
 /e2e/bin/
 /e2e/logs/
 /e2e/dcm.log
+/e2e/probe.log
 /e2e/status.json
+/e2e/manager.rendered.yaml
 

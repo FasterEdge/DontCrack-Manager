@@ -117,12 +117,14 @@ func TestClientHealthy(t *testing.T) {
 
 // stubProvider 是 Provider 的测试替身。
 type stubProvider struct {
-	status  []ServiceStatus
-	healthy bool
+	status []ServiceStatus
+	alive  bool
+	ready  bool
 }
 
 func (p *stubProvider) Status() []ServiceStatus { return p.status }
-func (p *stubProvider) Healthy() bool           { return p.healthy }
+func (p *stubProvider) Alive() bool             { return p.alive }
+func (p *stubProvider) Ready() bool             { return p.ready }
 
 // doReq 执行一次带上下文的 HTTP 请求并返回状态码与响应体。
 func doReq(t *testing.T, method, url string) (int, []byte) {
@@ -147,20 +149,31 @@ func TestAggregatorEndpoints(t *testing.T) {
 			{Name: "web", Desired: "running", State: "running", Pid: 111},
 			{Name: "db", Desired: "running", State: "backoff"},
 		},
-		healthy: true,
+		alive: true,
+		ready: true,
 	}
 	srv := NewServer("127.0.0.1:0", "", prov, func() error { shutdownCalls.Add(1); return nil }, logging.NewDefault())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 
-	// /healthz
-	code, _ := doReq(t, http.MethodGet, ts.URL+"/healthz")
+	// /healthz(liveness)与 /readyz(readiness)在全绿时都应 200。
+	code, body := doReq(t, http.MethodGet, ts.URL+"/healthz")
 	if code != http.StatusOK {
 		t.Fatalf("healthz = %d, 期望 200", code)
 	}
+	if string(body) != "ok" {
+		t.Fatalf("healthz 响应体 = %q, 期望 ok", body)
+	}
+	code, body = doReq(t, http.MethodGet, ts.URL+"/readyz")
+	if code != http.StatusOK {
+		t.Fatalf("readyz = %d, 期望 200", code)
+	}
+	if string(body) != "ready" {
+		t.Fatalf("readyz 响应体 = %q, 期望 ready", body)
+	}
 
 	// /status
-	code, body := doReq(t, http.MethodGet, ts.URL+"/status")
+	code, body = doReq(t, http.MethodGet, ts.URL+"/status")
 	if code != http.StatusOK {
 		t.Fatalf("status = %d, 期望 200", code)
 	}
@@ -178,16 +191,73 @@ func TestAggregatorEndpoints(t *testing.T) {
 		t.Fatalf("shutdown: status=%d calls=%d", code, shutdownCalls.Load())
 	}
 
-	// 不健康时 /healthz 503
-	prov.healthy = false
+	// 业务不就绪但监管器存活: readyz 必须 503, healthz 必须仍 200 ——
+	// 这是两类探针语义分离的核心断言(liveness 不因业务抖动失败而要重启进程)。
+	prov.ready = false
+	code, body = doReq(t, http.MethodGet, ts.URL+"/readyz")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("依赖未就绪 readyz = %d, 期望 503", code)
+	}
+	if !strings.Contains(string(body), "not ready") {
+		t.Fatalf("readyz 响应体 = %q, 期望含 not ready", body)
+	}
+	code, _ = doReq(t, http.MethodGet, ts.URL+"/healthz")
+	if code != http.StatusOK {
+		t.Fatalf("业务不就绪时 healthz = %d, 期望仍 200(liveness 与业务解耦)", code)
+	}
+
+	// 监管器自身失活: 两者都应 503。
+	prov.alive = false
 	code, _ = doReq(t, http.MethodGet, ts.URL+"/healthz")
 	if code != http.StatusServiceUnavailable {
-		t.Fatalf("不健康 healthz = %d, 期望 503", code)
+		t.Fatalf("监管器失活 healthz = %d, 期望 503", code)
+	}
+	code, _ = doReq(t, http.MethodGet, ts.URL+"/readyz")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("监管器失活 readyz = %d, 期望 503", code)
+	}
+}
+
+// TestReadyzNotReadyWhenDependencyNotReady 证明 /readyz 的依赖语义:
+// 依赖服务永远起不来(二进制不存在)时, 依赖方即便进程活着也不 ready ——
+// 这正是此前 /healthz 与 /readyz 实现同构时无法表达的区分。
+//
+// 真实 supervisor 的链路测试在 internal/supervisor 侧(TestReadyzBlockedWhenDependencyNotReady),
+// 此处只验证 HTTP 层: provider 的 ready=false 必须映射为 503 且报文可读。
+func TestReadyzNotReadyWhenDependencyNotReady(t *testing.T) {
+	prov := &stubProvider{
+		status: []ServiceStatus{
+			{Name: "web", Desired: "running", State: "running", Pid: 222},
+		},
+		alive: true,
+		ready: false,
+	}
+	srv := NewServer("127.0.0.1:0", "", prov, nil, logging.NewDefault())
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	// 依赖未就绪: readyz 必须 503 且报文说明"未就绪"。
+	code, body := doReq(t, http.MethodGet, ts.URL+"/readyz")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("依赖未就绪 readyz = %d, 期望 503", code)
+	}
+	if !strings.Contains(string(body), "not ready") {
+		t.Fatalf("readyz 报文 = %q, 期望含 not ready", body)
+	}
+	// liveness 与业务无关: 业务不就绪监管器仍存活(200)。
+	if code, _ = doReq(t, http.MethodGet, ts.URL+"/healthz"); code != http.StatusOK {
+		t.Fatalf("业务不就绪时 healthz = %d, 期望 200", code)
+	}
+
+	// /status 必须仍可读(503 的 readyz 不应连带打挂诊断接口)。
+	code, _ = doReq(t, http.MethodGet, ts.URL+"/status")
+	if code != http.StatusOK {
+		t.Fatalf("依赖未就绪时 status = %d, 期望 200", code)
 	}
 }
 
 func TestAggregatorAuth(t *testing.T) {
-	prov := &stubProvider{healthy: true}
+	prov := &stubProvider{alive: true, ready: true}
 	srv := NewServer("127.0.0.1:0", "topsecret", prov, nil, logging.NewDefault())
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)

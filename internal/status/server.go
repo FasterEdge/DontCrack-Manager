@@ -31,6 +31,7 @@ func NewServer(addr, password string, prov Provider, shutdown ShutdownFunc, log 
 	s := &Server{prov: prov, password: password, shutdown: shutdown, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/shutdown", s.handleShutdown)
 	mux.HandleFunc("/", s.handleRoot)
@@ -83,18 +84,37 @@ func (s *Server) checkPassword(r *http.Request) error {
 	return errors.New("unauthorized")
 }
 
+// handleHealthz 是 liveness 探针: 只回答"根管理器自己还活着吗"。
+// 刻意不因业务服务不健康而返回 503 —— liveness 失败会让 K8s 重启整个 Pod,
+// 把可自愈的业务抖动放大成架构性故障; 业务就绪与否由 /readyz 表达。
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if err := s.checkPassword(r); err != nil {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if s.prov.Healthy() {
+	if s.prov.Alive() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 		return
 	}
-	http.Error(w, "not healthy", http.StatusServiceUnavailable)
+	http.Error(w, "manager not alive", http.StatusServiceUnavailable)
+}
+
+// handleReadyz 是 readiness 探针: 全部启用服务的 DependsOn 依赖就绪且探针通过
+// 才返回 200 —— 供 K8s / 上游负载均衡判断是否把流量导给这套实例。
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if err := s.checkPassword(r); err != nil {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if s.prov.Ready() {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ready"))
+		return
+	}
+	http.Error(w, "not ready", http.StatusServiceUnavailable)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -132,5 +152,5 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	_, _ = w.Write([]byte("DontCrack-Manager: 根管理器聚合状态服务\nGET /healthz  GET /status  POST /shutdown\n"))
+	_, _ = w.Write([]byte("DontCrack-Manager: 根管理器聚合状态服务\nGET /healthz(存活)  GET /readyz(依赖就绪)  GET /status  POST /shutdown\n"))
 }

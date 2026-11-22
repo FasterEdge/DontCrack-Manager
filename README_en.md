@@ -31,8 +31,11 @@
 - **Backoff restarts**: if a DontCrack process itself dies, restart per
   `always | on-failure | never` with exponential backoff (`backoff_max` cap; reset after 30s uptime);
 - **Graceful shutdown**: SIGINT/SIGTERM forwarded to every DontCrack (which stops its child
-  first), SIGKILL fallback after the grace period;
-- **Aggregated status**: optional root HTTP service — `/healthz` (aggregate health),
+  first), then the **whole process tree** is force-killed after the grace period;
+- **Process-tree containment**: a separate process group (Setpgid) on unix, one Job Object
+  (`KILL_ON_JOB_CLOSE`) per instance on Windows — orphan children are swept before restart;
+- **Aggregated status**: optional root HTTP service — `/healthz` (liveness: the manager itself
+  is alive), `/readyz` (readiness: every `depends_on` dependency is ready and probes pass),
   `/status` (per-service JSON detail), `/shutdown` (remote graceful stop of all);
 - **Fail-closed security**: dependency cycles / duplicate ports / bad policies refuse startup;
   external listeners require a password (constant-time compare, same scheme as DontCrack family).
@@ -50,7 +53,8 @@ go build -o dontcrack-manager ./cmd/dontcrack-manager
 ./dontcrack-manager -config /etc/dontcrack-manager.yaml
 
 # query aggregated status
-curl http://127.0.0.1:11884/healthz
+curl http://127.0.0.1:11884/healthz   # liveness: manager process alive -> 200
+curl http://127.0.0.1:11884/readyz    # readiness: all deps ready and probes pass -> 200 else 503
 curl http://127.0.0.1:11884/status
 curl -X POST http://127.0.0.1:11884/shutdown   # remote graceful shutdown
 ```
@@ -97,19 +101,48 @@ services:
 
 | Path | Method | Description |
 | ---- | ---- | ---- |
-| `/healthz` | GET | 200 when all enabled services are healthy; otherwise 503 |
+| `/healthz` | GET | **liveness**: 200 as long as the manager itself is alive — deliberately independent of service health (a business blip must not restart the instance) |
+| `/readyz` | GET | **readiness**: 200 only when every enabled service's `depends_on` dependencies are ready and probes pass; otherwise 503 |
 | `/status` | GET | per-service JSON detail (DontCrack PID / child PID / heartbeat snapshot / restarts / last exit code) |
 | `/shutdown` | POST | trigger graceful shutdown of everything |
 
+The two probes are **intentionally different**, mirroring Kubernetes `livenessProbe` vs
+`readinessProbe`:
+
+- `/healthz` only reports whether the manager process can still answer queries. It stays 200
+  when a service crashes or a dependency never comes up — otherwise liveness failure makes the
+  orchestrator restart the whole instance, turning a self-healing blip into an architectural outage;
+- `/readyz` shares the **same** readiness predicate with the internal `waitDeps`, so "readyz is
+  green" and "a dependent may start" are the same fact, with no divergence between the two.
+  With no enabled services it fail-closed returns 503.
+
 Auth priority matches DontCrack: `Authorization: Bearer <pw>` > `X-DontCrack-Password` > `?password=`.
 
-### 5. Shutdown Semantics
+### 5. Shutdown Semantics and Process-Tree Containment
+
+Shutdown:
 
 1. Receive SIGINT/SIGTERM (or `/shutdown`);
-2. Cancel heartbeat refresh and dependency waits; send SIGTERM to every DontCrack instance
-   (DontCrack stops its child first);
+2. Cancel heartbeat refresh and dependency waits; request graceful stop from every DontCrack
+   instance (SIGTERM / Windows equivalent);
 3. Wait for all to exit, capped by `shutdown_grace`;
-4. SIGKILL fallback for survivors after the grace period (fail-closed, no orphans left).
+4. Force-terminate the **whole process tree** for survivors after the grace period
+   (fail-closed, no orphans left).
+
+The tree container is platform-specific; its capability boundaries are stated plainly:
+
+| Platform | Container | Graceful stop | Force kill | Boundary |
+| ---- | ------ | -------- | -------- | -------- |
+| Linux/macOS | separate process group (`Setpgid`) | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)` | a child that calls `setsid` itself escapes the group and is out of range |
+| Windows | one Job Object per instance (`KILL_ON_JOB_CLOSE`) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` (SIGTERM equivalent) | `TerminateJobObject` (whole tree) | with no console (service launch) the graceful channel may fail → force kill after grace; a child with `BREAKAWAY_OK` escapes the Job |
+
+> Windows previously degraded to `taskkill /T /F` (hard kill only, no graceful semantics). It
+> now uses Job Object containment plus a CTRL_BREAK graceful request: the force-kill guarantee
+> comes from the kernel instead of an external command, and closing the Job handle on abnormal
+> manager exit triggers `KILL_ON_JOB_CLOSE` to sweep residual members — a stronger no-orphan
+> guarantee than `taskkill`. If containment fails (e.g. this process is already inside a Job that
+> forbids nesting) startup is not blocked; a warning is logged and force-kill degrades to
+> "DontCrack process only".
 
 ### 6. Division of Labor with DontCrack
 
@@ -128,23 +161,39 @@ with HTTP probe / worker crashing periodically), covering:
 2. probe health (`healthz=up` + `/heartbeat` snapshot `state=running`);
 3. DontCrack-level auto-restart (worker crash auto-restart, state-file counter increments);
 4. manager-level restart (kill the DontCrack process → `restart=on-failure` recovers it);
-5. no-orphan guarantee (after kill -9 of a DontCrack, its children are cleaned up by process group);
-6. aggregated `/healthz` `/status` and graceful `/shutdown` (all processes gone, exit code 0).
+5. no-orphan guarantee (after kill -9 of a DontCrack, its children are swept by process-tree containment);
+6. probe semantics split and graceful `/shutdown` (all processes gone, exit code 0).
+
+Script paths are parameterized, so they run both in the Docker layout and in a CI checkout:
 
 ```bash
+# Docker layout (equivalent to the historical usage)
 docker run --rm \
   -v $(pwd):/src/dcm \
   -v /path/to/DontCrack4ManyLinux:/src/dc4m \
   -v /path/to/this/repo/e2e:/e2e -w /e2e \
-  golang:1.25 bash /e2e/e2e_test.sh
+  golang:1.27 bash /e2e/e2e_test.sh
+
+# CI checkout layout (no docker needed)
+DC4M_DIR=/path/to/DontCrack4ManyLinux DCM_DIR=/path/to/DontCrack-Manager \
+  bash e2e/e2e_test.sh
+
+# probe-semantics run (dependency never ready → /readyz 503 while /healthz 200)
+DC4M_DIR=/path/to/DontCrack4ManyLinux DCM_DIR=/path/to/DontCrack-Manager \
+  bash e2e/readyz_test.sh
 ```
+
+`.github/workflows/e2e.yml` runs both scripts on a Linux runner, so the README's
+"reproducible end-to-end" claim now has CI evidence; the run logs and `/status` snapshot are
+uploaded as artifacts.
 
 > The integration run caught and fixed: ① DontCrack flag-swallowing (a `-args` value starting
 > with `-` gets absorbed by the flag package, silently resetting later flags → all flags now
 > use the `-flag=value` form + fail-closed guard in DontCrack); ② DontCrack auto-restart never
 > firing (`CurrentProcess` not released, restart plan always judged stale); ③ the root
 > manager's "no orphans" promise unfulfilled (children orphaned after DontCrack is killed →
-> Setpgid process-group management).
+> process-group / Job Object containment); ④ `/healthz` and `/readyz` were the same
+> implementation with different wording → split into real liveness/readiness semantics.
 
 ### 8. Tests
 

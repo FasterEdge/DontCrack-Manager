@@ -120,9 +120,9 @@ services:
 	sup.StopAll(5 * time.Second)
 	waitMarker(t, logf, "signaled", 3*time.Second)
 
-	// Healthy 应为 false(全部停止)。
-	if sup.Healthy() {
-		t.Fatal("停止后 Healthy() 应为 false")
+	// Ready 应为 false(全部停止)。
+	if sup.Ready() {
+		t.Fatal("停止后 Ready() 应为 false")
 	}
 }
 
@@ -303,7 +303,7 @@ services:
 	sup.StopAll(3 * time.Second)
 }
 
-func TestHealthyWithRunningService(t *testing.T) {
+func TestReadyWithRunningService(t *testing.T) {
 	stub := writeStub(t)
 	logf := filepath.Join(t.TempDir(), "ok.log")
 	sup := newTestSupervisor(t, `
@@ -318,10 +318,68 @@ services:
 	defer cancel()
 	sup.Run(ctx)
 	waitMarker(t, logf, "started", 8*time.Second)
-	if !sup.Healthy() {
-		t.Fatal("运行中服务 Healthy() 应为 true")
+	if !sup.Ready() {
+		t.Fatal("运行中服务 Ready() 应为 true")
+	}
+	// liveness 与业务无关: 即使业务就绪也恒为 true(监管器刚启动尚未 StopAll)。
+	if !sup.Alive() {
+		t.Fatal("监管器存活期间 Alive() 应为 true")
 	}
 	sup.StopAll(3 * time.Second)
+}
+
+// TestReadyzBlockedWhenDependencyNotReady: readyz 必须反映 DependsOn 依赖是否
+// 就绪 —— 依赖方自身活着但依赖永远无法就绪(二进制不存在)时, readyz 必须 false,
+// 且依赖方根本不应被拉起(依赖未就绪不得启动)。
+func TestReadyzBlockedWhenDependencyNotReady(t *testing.T) {
+	stub := writeStub(t)
+	webLog := filepath.Join(t.TempDir(), "web.log")
+	sup := newTestSupervisor(t, `
+dontcrack_binary: `+stub+`
+services:
+  - name: db
+    path: /opt/db
+    port: 11883
+    dontcrack_binary: /nonexistent/dontcrack
+    restart: always
+    backoff: 100ms
+  - name: web
+    path: /opt/web
+    port: 11884
+    depends_on: [db]
+    depend_timeout: 300ms
+    backoff: 100ms
+    dontcrack_env: [DCM_TEST_LOG=`+webLog+`]
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sup.Run(ctx)
+	t.Cleanup(func() { sup.StopAll(3 * time.Second) })
+
+	// db 起不来 → web 的依赖永不就绪 → 整体不 ready。
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		if !sup.Ready() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if sup.Ready() {
+		t.Fatal("依赖未就绪时 Ready() 必须为 false")
+	}
+	// 依赖未就绪不得启动依赖方进程。
+	if data, _ := os.ReadFile(webLog); strings.Contains(string(data), "started") {
+		t.Fatalf("依赖未就绪时不应启动 web:\n%s", string(data))
+	}
+	// 依赖方自身进程未拉起, 但其服务条目必须在状态里可见(便于诊断)。
+	st := sup.Status()
+	if len(st) != 2 {
+		t.Fatalf("状态数 = %d, 期望 2", len(st))
+	}
+	// liveness 与业务无关: 业务全崩监管器仍存活。
+	if !sup.Alive() {
+		t.Fatal("业务失败不应让 Alive() 变 false(liveness 与业务解耦)")
+	}
 }
 
 func TestDisabledServiceNotStarted(t *testing.T) {
@@ -343,8 +401,8 @@ services:
 	if data, _ := os.ReadFile(logf); strings.Contains(string(data), "started") {
 		t.Fatalf("禁用服务不应启动:\n%s", string(data))
 	}
-	if sup.Healthy() {
-		t.Fatal("无启用服务时 Healthy() 应为 false")
+	if sup.Ready() {
+		t.Fatal("无启用服务时 Ready() 应为 false")
 	}
 	sup.StopAll(3 * time.Second)
 }

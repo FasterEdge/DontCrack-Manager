@@ -1,0 +1,69 @@
+name: '端到端联调'
+# e2e/ 下的联调脚本此前只存在于仓库里, 从未被 CI 执行(README 宣称"可复现端到端"
+# 却无自动化证据)。本 workflow 在 Linux runner 上真跑: 真实 DontCrack 二进制 +
+# 3 服务场景 + 探针语义差异, 失败即 CI 失败。
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: 'dontcrack-manager-e2e-${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: '端到端联调(真实 DontCrack)'
+    runs-on: ubuntu-latest
+    steps:
+    - name: '检出 DontCrack-Manager'
+      uses: actions/checkout@v7
+      with:
+        path: dcm
+    - name: '检出 DontCrack4ManyLinux(提供真实 DontCrack 二进制)'
+      uses: actions/checkout@v7
+      with:
+        repository: FasterEdge/DontCrack4ManyLinux
+        path: dc4m
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: dcm/go.mod
+        cache-dependency-path: dcm/go.sum
+    - name: '环境自检(联调依赖 wget 与 python3)'
+      run: |
+        set -euo pipefail
+        command -v wget
+        command -v python3
+        go version
+    - name: '单元测试 + 静态检查(改动文件必须在同一 runner 上先绿)'
+      working-directory: dcm
+      run: |
+        go vet ./...
+        go test ./...
+    - name: '端到端联调(3 服务: 依赖顺序/探针/双层重启/优雅停机/无残留)'
+      env:
+        E2E_DIR: ${{ github.workspace }}/dcm/e2e
+        DC4M_DIR: ${{ github.workspace }}/dc4m
+        DCM_DIR: ${{ github.workspace }}/dcm
+      run: bash "$E2E_DIR/e2e_test.sh"
+    - name: '探针语义联调(/readyz 依赖未就绪 → 503, /healthz → 200)'
+      env:
+        E2E_DIR: ${{ github.workspace }}/dcm/e2e
+        DC4M_DIR: ${{ github.workspace }}/dc4m
+        DCM_DIR: ${{ github.workspace }}/dcm
+      run: bash "$E2E_DIR/readyz_test.sh"
+    - name: '上传联调日志'
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: 'dontcrack-manager-e2e-logs-${{ github.run_id }}'
+        path: |
+          dcm/e2e/*.log
+          dcm/e2e/status.json
+        if-no-files-found: 'warn'
+        retention-days: 14

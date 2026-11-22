@@ -1,0 +1,26 @@
+# 探针语义联调配置: backend 永远无法启动(二进制不存在), gateway 依赖它。
+# 用于证明 /readyz(readiness) 与 /healthz(liveness) 语义真的不同:
+# 依赖未就绪 → readyz 503, 但监管器自身存活 → healthz 200。
+log_level: info
+listen: 127.0.0.1:11898
+dontcrack_binary: /nonexistent/dontcrack
+shutdown_grace: 5s
+
+services:
+  # backend: 二进制不存在, 启动必然失败, 永远不会就绪。
+  - name: backend
+    path: /opt/backend
+    port: 11896
+    restart: always
+    backoff: 200ms
+    backoff_max: 1s
+
+  # gateway: 依赖 backend; backend 永不就绪 → gateway 只能停在 pending。
+  - name: gateway
+    path: /opt/gateway
+    port: 11897
+    depends_on: [backend]
+    depend_timeout: 1s
+    restart: always
+    backoff: 200ms
+    backoff_max: 1s
