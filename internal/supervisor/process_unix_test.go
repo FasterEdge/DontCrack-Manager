@@ -34,6 +34,26 @@ func spawnSleeper(t *testing.T) *exec.Cmd {
 	return cmd
 }
 
+// waitExited 在 timeout 内等待进程真正退出(即完成 wait 回收), 返回是否已退出。
+//
+// 为什么必须回收而不是只看信号是否发得出去: 进程被 SIGKILL 后若没人 wait,
+// 它会变成僵尸并**继续留在原进程组里**, 于是 kill(-pgid, 0) 照样成功、
+// Signal(0) 照样成功 —— 用它们判断"进程组已消失"会永远等不到。CI 上这两个
+// 用例各卡满 5s 超时, 根因就是这个: 断言用的是"信号可送达", 而不是"进程已回收"。
+func waitExited(cmd *exec.Cmd, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // TestProcessGroupContainsAndKillsTree: attach 后 force 必须真的杀掉进程。
 func TestProcessGroupContainsAndKillsTree(t *testing.T) {
 	cmd := spawnSleeper(t)
@@ -54,14 +74,9 @@ func TestProcessGroupContainsAndKillsTree(t *testing.T) {
 	if err := tree.force(); err != nil {
 		t.Fatalf("force 失败: %v", err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := syscall.Kill(-pg.pgid, 0); err != nil {
-			return // 组已消失
-		}
-		time.Sleep(50 * time.Millisecond)
+	if !waitExited(cmd, 5*time.Second) {
+		t.Fatalf("force 后进程组仍存在(进程组强杀未生效)")
 	}
-	t.Fatalf("force 后进程组仍存在(进程组强杀未生效)")
 }
 
 // TestProcessGroupGracefulSendsSIGTERM: graceful 必须真的投递 SIGTERM 给进程组,
@@ -76,17 +91,9 @@ func TestProcessGroupGracefulSendsSIGTERM(t *testing.T) {
 		t.Fatalf("graceful 失败: %v", err)
 	}
 	// bash 的 sleep 被 SIGTERM 打断, 整棵树应退出。
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if cmd.ProcessState != nil {
-			return
-		}
-		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+	if !waitExited(cmd, 5*time.Second) {
+		t.Fatal("graceful(SIGTERM) 后进程仍未退出")
 	}
-	t.Fatal("graceful(SIGTERM) 后进程仍未退出")
 }
 
 // TestSweepTreeClearsResidual: sweepTree 在进程本体已死时也要能清理树内残留,
