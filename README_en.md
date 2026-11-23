@@ -34,6 +34,8 @@
   first), then the **whole process tree** is force-killed after the grace period;
 - **Process-tree containment**: a separate process group (Setpgid) on unix, one Job Object
   (`KILL_ON_JOB_CLOSE`) per instance on Windows — orphan children are swept before restart;
+  Linux additionally enables a child subreaper to sweep children that DontCrack moved into
+  their own process group and the kernel then reparented to this manager (see section 5);
 - **Aggregated status**: optional root HTTP service — `/healthz` (liveness: the manager itself
   is alive), `/readyz` (readiness: every `depends_on` dependency is ready and probes pass),
   `/status` (per-service JSON detail), `/shutdown` (remote graceful stop of all);
@@ -133,8 +135,40 @@ The tree container is platform-specific; its capability boundaries are stated pl
 
 | Platform | Container | Graceful stop | Force kill | Boundary |
 | ---- | ------ | -------- | -------- | -------- |
-| Linux/macOS | separate process group (`Setpgid`) | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)` | a child that calls `setsid` itself escapes the group and is out of range |
+| Linux | separate process group (`Setpgid`) + child subreaper | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)`, then sweep reparented orphans by `PPid` | a child that calls `setsid` again leaves nothing observable behind (see below) |
+| other unix (macOS/BSD) | separate process group (`Setpgid`) | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)` | no subreaper equivalent, so a child DontCrack put in its own group cannot be swept when the group broadcast misses it |
 | Windows | one Job Object per instance (`KILL_ON_JOB_CLOSE`) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` (SIGTERM equivalent) | `TerminateJobObject` (whole tree) | with no console (service launch) the graceful channel may fail → force kill after grace; a child with `BREAKAWAY_OK` escapes the Job |
+
+### Why Linux needs an extra subreaper
+
+Group broadcast alone is **not enough**, and end-to-end testing exposed it: DontCrack also
+calls `setpgid` on its own children (it converges grandchildren per group), so those children
+land in **their own** process group, disjoint from this manager's `kill(-pgid)` range. After
+DontCrack is `kill -9`ed the child becomes an orphan — the group broadcast cannot reach it,
+the kernel reparents it to init, and the manager cannot even see a `PPid` relation any more.
+The "no orphan children" promise silently broke (in production: the port stayed occupied by
+the leftover process, and the restarted service could never bind).
+
+The fix has two parts. At startup `prctl(PR_SET_CHILD_SUBREAPER)` (`orphan_linux.go`) makes
+orphans that would have gone to init reparent to this manager instead, restoring an
+observable `PPid` relation. Then every `killOrphans` sweeps a second time by `PPid == self`
+in addition to the group broadcast, killing each hit via its own process group and reaping it
+with `wait4` (an unreaped process is a zombie, which residual checks still flag).
+
+Two boundaries the sweep must respect, both pinned by tests (`orphan_linux_test.go`):
+
+- **never steal `cmd.Wait`'s exit status**: the DontCrack processes still reaped by this
+  manager's `cmd.Wait` are excluded, otherwise `waitExit` blocks forever and the service stays
+  `running` for good;
+- **broadcast to a group only when the orphan is its own group leader**: after DontCrack's
+  `setpgid` the leader *is* the child, so the broadcast also catches its descendants; when it
+  is not the leader, `-pid` could hit an unrelated group, so the sweep degrades to killing that
+  single process.
+
+On non-Linux platforms it is a no-op (`orphan_other.go`): Windows does not need it, because a
+process joining a Job passes membership to its children and `TerminateJobObject` still catches
+grandchildren; macOS/BSD have no `prctl`, so this capability boundary is recorded as a
+degradation.
 
 > Windows previously degraded to `taskkill /T /F` (hard kill only, no graceful semantics). It
 > now uses Job Object containment plus a CTRL_BREAK graceful request: the force-kill guarantee

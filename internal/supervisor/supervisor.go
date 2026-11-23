@@ -81,11 +81,27 @@ type Supervisor struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	alive  atomic.Bool // 监管器自身存活(/healthz liveness), 与业务服务状态无关
+
+	// own 记录本管理器亲自启动的 DontCrack PID(含历史代), 供孤儿补扫排除。
+	// 单独一把锁是因为登记点必须紧贴 cmd.Start(): 若等到 sv.cmd 赋值(另一把锁、
+	// 另一个时刻)才可见, 期间的补扫会把刚启动的 DontCrack 当孤儿杀掉。
+	ownMu sync.Mutex
+	own   map[int]bool
+
+	// reapOrphans 表示孤儿补扫的前提(subreaper)是否真的立起来了。
+	// 没有它就不扫: 补扫按 "PPid == 本进程" 找目标, 前提不成立时那个判据毫无
+	// 意义, 反而可能误杀本进程的其它合法孩子。
+	reapOrphans atomic.Bool
 }
 
 // New 创建监管器(尚未启动服务)。
 func New(cfg *config.Manager, log *logging.Logger) *Supervisor {
-	s := &Supervisor{cfg: cfg, log: log, svcs: make(map[string]*Service, len(cfg.Services))}
+	s := &Supervisor{
+		cfg:  cfg,
+		log:  log,
+		svcs: make(map[string]*Service, len(cfg.Services)),
+		own:  make(map[int]bool),
+	}
 	s.alive.Store(true)
 	return s
 }
@@ -93,6 +109,16 @@ func New(cfg *config.Manager, log *logging.Logger) *Supervisor {
 // Run 启动全部启用服务的监管循环(非阻塞), 并启动心跳刷新。
 func (s *Supervisor) Run(ctx context.Context) {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	// 开启孤儿再托付(Linux child subreaper): DontCrack 自己也会给子进程 setpgid,
+	// 两层进程组交替后本管理器的组广播可能打不到里面那层, 强杀后残余子进程会被
+	// 内核托付给 init 从而彻底失去踪迹。设为 subreaper 后它们改托付给本进程,
+	// PPid 关系可观测, 清扫才有依据(见 orphan_linux.go)。
+	if err := enableOrphanReaping(); err != nil {
+		s.log.Warnf("未能开启孤儿再托付(child subreaper): %v; "+
+			"DontCrack 被强杀后其子进程可能逃离本管理器可见范围", err)
+	} else {
+		s.reapOrphans.Store(true)
+	}
 	for i := range s.cfg.Services {
 		svcCfg := &s.cfg.Services[i]
 		if !svcCfg.IsEnabled() {
@@ -415,6 +441,9 @@ func (sv *Service) spawnWithTree(ctx context.Context, tree procTree) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 %s: %w", binary, err)
 	}
+	// 紧贴 Start 登记: 这道登记必须在任何可能的孤儿补扫之前生效, 因此不能等
+	// sv.cmd 赋值(另一把锁、另一个时刻)。登记的是"由本进程 Wait 回收"的身份。
+	sv.sup.markOwn(cmd.Process.Pid)
 
 	sv.mu.Lock()
 	sv.cmd = cmd
@@ -608,6 +637,49 @@ func (sv *Service) killOrphans() {
 	sv.tree = nil
 	sv.mu.Unlock()
 	sweepTree(tree)
+	// 组广播的可见范围到此为止: DontCrack 自己 setpgid 过的子进程不在本组内,
+	// 只能按"被内核托付给本进程的孤儿"补扫一次(Linux); 其它平台为空操作。
+	sv.sup.sweepOrphans()
+}
+
+// sweepOrphans 清理被内核托付给本管理器的孤儿进程(Linux child subreaper 路径),
+// 返回实际清理的 PID 供日志/测试断言。非 Linux 平台恒为空。
+//
+// tracked 排除本管理器亲自启动的 DontCrack(见 own): 它们虽是本进程的孩子, 但仍由
+// cmd.Wait 回收, 对它们调 Wait4 会抢走退出状态, 让 waitExit 永久阻塞。
+func (s *Supervisor) sweepOrphans() []int {
+	if !s.reapOrphans.Load() {
+		return nil
+	}
+	swept := sweepReparentedOrphans(s.ownPIDs())
+	if len(swept) > 0 {
+		s.log.Warnf("清理被托付给本管理器的孤儿子进程: %v", swept)
+	}
+	return swept
+}
+
+// markOwn 登记一个由本管理器启动的 DontCrack PID(供补扫排除)。
+func (s *Supervisor) markOwn(pid int) {
+	if pid <= 0 {
+		return
+	}
+	s.ownMu.Lock()
+	if s.own == nil {
+		s.own = make(map[int]bool)
+	}
+	s.own[pid] = true
+	s.ownMu.Unlock()
+}
+
+// ownPIDs 返回本管理器启动过的全部 DontCrack PID 快照。
+func (s *Supervisor) ownPIDs() map[int]bool {
+	s.ownMu.Lock()
+	defer s.ownMu.Unlock()
+	out := make(map[int]bool, len(s.own))
+	for pid := range s.own {
+		out[pid] = true
+	}
+	return out
 }
 
 // scanLines 逐行转发 DontCrack 输出到日志器。

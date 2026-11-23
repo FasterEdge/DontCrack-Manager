@@ -30,7 +30,7 @@
 - **退避重启**: DontCrack 进程自身崩溃后按 `always | on-failure | never` 策略指数退避恢复
   (上限 `backoff_max`; 稳定运行 30s 后退避归零);
 - **优雅停机**: SIGINT/SIGTERM(或 `/shutdown`)依次转发给各 DontCrack(其内部会先停子进程), 宽限后强杀**整棵进程树**兜底;
-- **进程树收容器**: unix 用独立进程组(Setpgid), Windows 用 Job Object(`KILL_ON_JOB_CLOSE`)—— DontCrack 崩溃后重启前按树清理, **不留孤儿子进程**;
+- **进程树收容器**: unix 用独立进程组(Setpgid), Windows 用 Job Object(`KILL_ON_JOB_CLOSE`)—— DontCrack 崩溃后重启前按树清理, **不留孤儿子进程**; Linux 另开 child subreaper, 补扫被 DontCrack 自己 `setpgid` 带离本组、又被内核托付给本管理器的子进程(见第五节);
 - **聚合状态**: 可选根管理 HTTP 服务 — `/healthz`(liveness: 根管理器自身存活) `/readyz`(readiness: 全部 `depends_on` 依赖就绪且探针通过) `/status`(JSON 详情) `/shutdown`(远程停全部);
 - **安全 fail-closed**: 依赖环/重复端口/非法策略一律拒绝启动; 对外监听必须配置密码
   (常数时间比较, 与 DontCrack 家族一致); 所有健康查询与停机宽限均有超时。
@@ -139,8 +139,35 @@ services:
 
 | 平台 | 收容器 | 优雅停止 | 强杀兜底 | 能力边界 |
 | ---- | ------ | -------- | -------- | -------- |
-| Linux/macOS | 独立进程组(`Setpgid`) | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)` | 子进程若自行 `setsid` 脱离进程组, 则不在强杀范围 |
+| Linux | 独立进程组(`Setpgid`) + child subreaper | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)`, 再按 `PPid` 补扫被托付的孤儿 | 子进程若自行 `setsid` 并再次脱离, 已无可观测依据(见下) |
+| 其它 unix(macOS/BSD) | 独立进程组(`Setpgid`) | `kill(-pgid, SIGTERM)` | `kill(-pgid, SIGKILL)` | 无 subreaper 等价物, DontCrack 自己的子进程组不在组广播范围时无法补扫 |
 | Windows | 每实例一个 Job Object(`KILL_ON_JOB_CLOSE`) | `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`(等价 SIGTERM) | `TerminateJobObject`(整棵树) | 若 DontCrack 无控制台(服务化启动), 优雅通道可能无效 → 只能靠宽限期后强杀; 子进程若带 `BREAKAWAY_OK` 逃逸出 Job 则不在强杀范围; 若进程已被上层收容器接管且禁止嵌套, 强杀交给上层(见下) |
+
+### 五之二、为什么 Linux 需要一个额外的 subreaper
+
+只靠进程组广播**不够**, 这一点在端到端联调里暴露过: DontCrack 自己也会给子进程
+`setpgid`(它要按组收敛孙进程), 于是子进程落在**它自己的**进程组里, 与本管理器的
+`kill(-pgid)` 寻址范围不相交。DontCrack 被 `kill -9` 后该子进程成了孤儿 —— 组广播
+打不到, 内核又把它托付给 init, 管理器的 `/proc` 里连 `PPid` 关系都看不到, "不留
+孤儿子进程"就此落空(线上表现为端口被残留进程占住, 重启后的服务永远绑不上)。
+
+修法是两段: 启动时 `prctl(PR_SET_CHILD_SUBREAPER)`(`orphan_linux.go`), 把"本该
+托付给 init"的孤儿改为托付给本管理器, 让 `PPid` 关系重新可观测; 之后每次
+`killOrphans` 在组广播之外再按 `PPid == 自身` 补扫一遍, 对命中的进程按其自身进程组
+强杀并用 `wait4` 回收(不收就是僵尸, 残留检查仍会判为残留)。
+
+补扫有两处必须守住的边界, 均由测试钉住(`orphan_linux_test.go`):
+
+- **不能抢走 `cmd.Wait` 的退出状态**: 仍由本管理器 `cmd.Wait` 回收的 DontCrack 本体
+  必须排除在外, 否则 `waitExit` 永久阻塞、服务永远停在 `running`;
+- **只对"自己是组长"的孤儿做组广播**: DontCrack 给子进程 `setpgid` 后组长正是子进程
+  自己, 广播能顺带收掉它的后代; 若不是组长, 对 `-pid` 广播可能命中一个毫不相干的
+  同名进程组, 因此退化为只杀该进程。
+
+非 Linux 平台是空操作(`orphan_other.go`): Windows 侧不需要 —— 进程加入 Job 后其派生
+子进程自动继承成员身份, `TerminateJobObject` 照样收得掉孙子进程; macOS/BSD 没有
+subreaper 的等价物(无 `prctl`), 该能力边界如实记为降级。
+
 
 Windows 侧的实现细节(与代码一一对应):
 
